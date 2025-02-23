@@ -1,1 +1,1 @@
-info-power.gl.at.ply.gg:23360
+127.0.0.1:5521
