@@ -293,8 +293,11 @@ NTSTATUS InitializeEtwProvider() {
 #pragma warning(disable: 4191) // Unsafe conversion of function pointer
 
     // Get EtwRegister function pointer dynamically
+    UNICODE_STRING etwRegisterName;
+    RtlInitUnicodeString(&etwRegisterName, L"EtwRegister");
+
     typedef NTSTATUS (NTAPI *pfnEtwRegister)(LPCGUID, PETWENABLECALLBACK, PVOID, PREGHANDLE);
-    pfnEtwRegister pEtwRegister = (pfnEtwRegister)MmGetSystemRoutineAddress(&(UNICODE_STRING)RTL_CONSTANT_STRING(L"EtwRegister"));
+    pfnEtwRegister pEtwRegister = (pfnEtwRegister)MmGetSystemRoutineAddress(&etwRegisterName);
 
     if (pEtwRegister) {
         status = pEtwRegister(
@@ -535,8 +538,11 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
 
     // Unregister ETW provider
     if (g_hEtwProvider) {
+        UNICODE_STRING etwUnregisterName;
+        RtlInitUnicodeString(&etwUnregisterName, L"EtwUnregister");
+
         typedef NTSTATUS (NTAPI *pfnEtwUnregister)(REGHANDLE);
-        pfnEtwUnregister pEtwUnregister = (pfnEtwUnregister)MmGetSystemRoutineAddress(&(UNICODE_STRING)RTL_CONSTANT_STRING(L"EtwUnregister"));
+        pfnEtwUnregister pEtwUnregister = (pfnEtwUnregister)MmGetSystemRoutineAddress(&etwUnregisterName);
         if (pEtwUnregister) {
             pEtwUnregister(g_hEtwProvider);
         }

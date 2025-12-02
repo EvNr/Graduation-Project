@@ -898,16 +898,8 @@ DWORD FindProcessByName(const wchar_t* processName) {
 // MAIN ENTRY POINT
 // ============================================================================
 
-int WINAPI WinMain(
-    _In_ HINSTANCE hInstance,
-    _In_opt_ HINSTANCE hPrevInstance,
-    _In_ LPSTR lpCmdLine,
-    _In_ int nShowCmd)
+int EliteMain()
 {
-    UNREFERENCED_PARAMETER(hInstance);
-    UNREFERENCED_PARAMETER(hPrevInstance);
-    UNREFERENCED_PARAMETER(lpCmdLine);
-    UNREFERENCED_PARAMETER(nShowCmd);
 
     #ifdef _DEBUG
     AllocConsole();
@@ -953,6 +945,25 @@ int WINAPI WinMain(
 
     client.Disconnect();
     return 0;
+}
+
+// Entry point wrappers for both console and GUI subsystems
+int main()
+{
+    return EliteMain();
+}
+
+int WINAPI WinMain(
+    _In_ HINSTANCE hInstance,
+    _In_opt_ HINSTANCE hPrevInstance,
+    _In_ LPSTR lpCmdLine,
+    _In_ int nShowCmd)
+{
+    UNREFERENCED_PARAMETER(hInstance);
+    UNREFERENCED_PARAMETER(hPrevInstance);
+    UNREFERENCED_PARAMETER(lpCmdLine);
+    UNREFERENCED_PARAMETER(nShowCmd);
+    return EliteMain();
 }
 
 /*
