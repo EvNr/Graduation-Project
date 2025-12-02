@@ -13,6 +13,13 @@
 #define _WIN32_WINNT _WIN32_WINNT_WIN10
 #define NTDDI_VERSION NTDDI_WIN10
 
+// Suppress common WDK warnings
+#pragma warning(disable: 4100) // Unreferenced formal parameter
+#pragma warning(disable: 4189) // Local variable initialized but not referenced
+#pragma warning(disable: 4201) // Nonstandard extension used: nameless struct/union
+#pragma warning(disable: 4244) // Conversion from type1 to type2, possible loss of data
+#pragma warning(disable: 4706) // Assignment within conditional expression
+
 #include <ntifs.h>
 #include <ntddk.h>
 #include <wchar.h>
