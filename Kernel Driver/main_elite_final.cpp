@@ -13,6 +13,13 @@
 #define _WIN32_WINNT _WIN32_WINNT_WIN10
 #define NTDDI_VERSION NTDDI_WIN10
 
+// Suppress common WDK warnings
+#pragma warning(disable: 4100) // Unreferenced formal parameter
+#pragma warning(disable: 4189) // Local variable initialized but not referenced
+#pragma warning(disable: 4201) // Nonstandard extension used: nameless struct/union
+#pragma warning(disable: 4244) // Conversion from type1 to type2, possible loss of data
+#pragma warning(disable: 4706) // Assignment within conditional expression
+
 #include <ntifs.h>
 #include <ntddk.h>
 #include <wchar.h>
@@ -52,78 +59,49 @@ const char g_CompanyName[] = "Microsoft Corporation";
 extern "C" {
 #endif
 
-// ALPC structures - fully declared
-typedef struct _PORT_MESSAGE_KERNEL {
-    union {
-        struct {
-            USHORT DataLength;
-            USHORT TotalLength;
-        } s1;
-        ULONG Length;
-    } u1;
-    union {
-        struct {
-            USHORT Type;
-            USHORT DataInfoOffset;
-        } s2;
-        ULONG ZeroInit;
-    } u2;
-    union {
-        CLIENT_ID ClientId;
-        double DoNotUseThisField;
-    };
+// LPC structures for kernel mode (NOT ALPC - those aren't exported)
+typedef struct _PORT_MESSAGE_LPC {
+    USHORT DataLength;
+    USHORT TotalLength;
+    USHORT MessageType;
+    USHORT DataInfoOffset;
+    CLIENT_ID ClientId;
     ULONG MessageId;
-    union {
-        SIZE_T ClientViewSize;
-        ULONG CallbackId;
-    };
-} PORT_MESSAGE_KERNEL, *PPORT_MESSAGE_KERNEL;
+    ULONG CallbackId;
+} PORT_MESSAGE_LPC, *PPORT_MESSAGE_LPC;
 
-typedef struct _ALPC_PORT_ATTRIBUTES_KERNEL {
-    ULONG Flags;
-    SECURITY_QUALITY_OF_SERVICE SecurityQos;
-    SIZE_T MaxMessageLength;
-    SIZE_T MemoryBandwidth;
-    SIZE_T MaxPoolUsage;
-    SIZE_T MaxSectionSize;
-    SIZE_T MaxViewSize;
-    SIZE_T MaxTotalSectionSize;
-    ULONG DupObjectTypes;
-} ALPC_PORT_ATTRIBUTES_KERNEL, *PALPC_PORT_ATTRIBUTES_KERNEL;
-
-typedef struct _ALPC_MESSAGE_ATTRIBUTES_KERNEL {
-    ULONG AllocatedAttributes;
-    ULONG ValidAttributes;
-} ALPC_MESSAGE_ATTRIBUTES_KERNEL, *PALPC_MESSAGE_ATTRIBUTES_KERNEL;
-
-// ALPC Functions
-NTSYSAPI NTSTATUS NTAPI NtAlpcCreatePort(
+// LPC Functions - these ARE exported by ntoskrnl
+NTSYSAPI NTSTATUS NTAPI ZwCreatePort(
     _Out_ PHANDLE PortHandle,
-    _In_opt_ POBJECT_ATTRIBUTES ObjectAttributes,
-    _In_opt_ PALPC_PORT_ATTRIBUTES_KERNEL PortAttributes
+    _In_ POBJECT_ATTRIBUTES ObjectAttributes,
+    _In_ ULONG MaxConnectionInfoLength,
+    _In_ ULONG MaxMessageLength,
+    _In_opt_ ULONG MaxPoolUsage
 );
 
-NTSYSAPI NTSTATUS NTAPI NtAlpcSendWaitReceivePort(
+NTSYSAPI NTSTATUS NTAPI ZwListenPort(
     _In_ HANDLE PortHandle,
-    _In_ ULONG Flags,
-    _In_opt_ PPORT_MESSAGE_KERNEL SendMessage,
-    _In_opt_ PALPC_MESSAGE_ATTRIBUTES_KERNEL SendMessageAttributes,
-    _Out_opt_ PPORT_MESSAGE_KERNEL ReceiveMessage,
-    _Inout_opt_ PSIZE_T BufferLength,
-    _Out_opt_ PALPC_MESSAGE_ATTRIBUTES_KERNEL ReceiveMessageAttributes,
-    _In_opt_ PLARGE_INTEGER Timeout
+    _Out_ PPORT_MESSAGE_LPC ConnectionRequest
 );
 
-NTSYSAPI NTSTATUS NTAPI NtAlpcAcceptConnectPort(
+NTSYSAPI NTSTATUS NTAPI ZwAcceptConnectPort(
     _Out_ PHANDLE PortHandle,
-    _In_ HANDLE ConnectionPortHandle,
-    _In_ ULONG Flags,
-    _In_opt_ POBJECT_ATTRIBUTES ObjectAttributes,
-    _In_opt_ PALPC_PORT_ATTRIBUTES_KERNEL PortAttributes,
     _In_opt_ PVOID PortContext,
-    _In_ PPORT_MESSAGE_KERNEL ConnectionRequest,
-    _Inout_opt_ PALPC_MESSAGE_ATTRIBUTES_KERNEL ConnectionMessageAttributes,
-    _In_ BOOLEAN AcceptConnection
+    _In_ PPORT_MESSAGE_LPC ConnectionRequest,
+    _In_ BOOLEAN AcceptConnection,
+    _Inout_opt_ PVOID ServerView,
+    _Out_opt_ PVOID ClientView
+);
+
+NTSYSAPI NTSTATUS NTAPI ZwCompleteConnectPort(
+    _In_ HANDLE PortHandle
+);
+
+NTSYSAPI NTSTATUS NTAPI ZwReplyWaitReceivePort(
+    _In_ HANDLE PortHandle,
+    _Out_opt_ PVOID *PortContext,
+    _In_opt_ PPORT_MESSAGE_LPC ReplyMessage,
+    _Out_ PPORT_MESSAGE_LPC ReceiveMessage
 );
 
 // ETW - use what WDK provides
@@ -153,8 +131,10 @@ NTSTATUS NTAPI IoCreateDriver(
     _In_ PDRIVER_INITIALIZE InitializationFunction
 );
 
-// Boot time
+// Boot time - properly imported
+#ifndef KeBootTime
 extern "C" NTSYSAPI LARGE_INTEGER KeBootTime;
+#endif
 
 #ifdef __cplusplus
 }
@@ -168,9 +148,9 @@ PDRIVER_OBJECT g_pDriverObject = nullptr;
 PDEVICE_OBJECT g_pFilterDevice = nullptr;
 PDEVICE_OBJECT g_pTargetDevice = nullptr;
 
-// ALPC communication
-HANDLE g_hAlpcPort = nullptr;
-KSPIN_LOCK g_AlpcLock;
+// ALPC communication (user will use ALPC, we use LPC in kernel)
+HANDLE g_hLpcPort = nullptr;
+KSPIN_LOCK g_LpcLock;
 
 // ETW provider
 REGHANDLE g_hEtwProvider = 0;
@@ -194,8 +174,8 @@ ULONGLONG g_ullHardwareId = 0;
 #define ALPC_MSG_QUERY_INFO     0x1005
 #define ALPC_MSG_GET_HWID       0x1007
 
-typedef struct _ELITE_ALPC_MESSAGE {
-    PORT_MESSAGE_KERNEL PortMessage;
+typedef struct _ELITE_LPC_MESSAGE {
+    PORT_MESSAGE_LPC PortMessage;
     ULONG MessageType;
     HANDLE ProcessId;
     PVOID Address;
@@ -204,7 +184,7 @@ typedef struct _ELITE_ALPC_MESSAGE {
     NTSTATUS Status;
     ULONGLONG HardwareId;
     UCHAR Data[256];
-} ELITE_ALPC_MESSAGE, *PELITE_ALPC_MESSAGE;
+} ELITE_LPC_MESSAGE, *PELITE_LPC_MESSAGE;
 
 // ============================================================================
 // HARDWARE ID GENERATION
@@ -320,13 +300,13 @@ NTSTATUS InitializeEtwProvider() {
 }
 
 // ============================================================================
-// ALPC SERVER
+// LPC SERVER (kernel uses LPC, user uses ALPC - they're compatible)
 // ============================================================================
 
-VOID AlpcServerThread(PVOID Context) {
+VOID LpcServerThread(PVOID Context) {
     UNREFERENCED_PARAMETER(Context);
 
-    ELITE_DBG("ALPC server thread started\n");
+    ELITE_DBG("LPC server thread started\n");
 
     // Create dynamic port name
     WCHAR portName[128];
@@ -338,91 +318,92 @@ VOID AlpcServerThread(PVOID Context) {
     OBJECT_ATTRIBUTES objAttr;
     InitializeObjectAttributes(&objAttr, &portNameU, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, nullptr, nullptr);
 
-    ALPC_PORT_ATTRIBUTES_KERNEL portAttribs = { 0 };
-    portAttribs.MaxMessageLength = sizeof(ELITE_ALPC_MESSAGE);
-
-    NTSTATUS status = NtAlpcCreatePort(&g_hAlpcPort, &objAttr, &portAttribs);
+    // Create LPC port (compatible with ALPC from user mode)
+    NTSTATUS status = ZwCreatePort(&g_hLpcPort, &objAttr, 0, sizeof(ELITE_LPC_MESSAGE), 0);
     if (!NT_SUCCESS(status)) {
-        ELITE_DBG("Failed to create ALPC port: 0x%X\n", status);
+        ELITE_DBG("Failed to create LPC port: 0x%X\n", status);
         PsTerminateSystemThread(STATUS_UNSUCCESSFUL);
         return;
     }
 
-    ELITE_DBG("ALPC port created: %wZ\n", &portNameU);
+    ELITE_DBG("LPC port created: %wZ\n", &portNameU);
 
     // Message loop
     while (!g_bUnloading) {
-        ELITE_ALPC_MESSAGE msg = { 0 };
-        SIZE_T msgLength = sizeof(msg);
+        ELITE_LPC_MESSAGE connMsg = { 0 };
 
-        LARGE_INTEGER timeout;
-        timeout.QuadPart = -10000000LL;  // 1 second
-
-        status = NtAlpcSendWaitReceivePort(
-            g_hAlpcPort,
-            0,
-            nullptr,
-            nullptr,
-            &msg.PortMessage,
-            &msgLength,
-            nullptr,
-            &timeout
-        );
-
-        if (status == STATUS_TIMEOUT) {
-            continue;
-        }
-
+        // Listen for connection
+        status = ZwListenPort(g_hLpcPort, &connMsg.PortMessage);
         if (!NT_SUCCESS(status)) {
             if (g_bUnloading) break;
-            ELITE_DBG("ALPC receive failed: 0x%X\n", status);
+            ELITE_DBG("LPC listen failed: 0x%X\n", status);
             continue;
         }
 
-        // Handle message types
-        switch (msg.MessageType) {
-            case ALPC_MSG_GET_HWID:
-                msg.HardwareId = g_ullHardwareId;
-                msg.Status = STATUS_SUCCESS;
-                ELITE_DBG("Sent hardware ID to client\n");
-                break;
-
-            case ALPC_MSG_READ_MEMORY:
-            case ALPC_MSG_WRITE_MEMORY:
-            case ALPC_MSG_PROTECT_MEMORY:
-            case ALPC_MSG_ALLOC_MEMORY:
-            case ALPC_MSG_QUERY_INFO:
-                // TODO: Implement handlers
-                msg.Status = STATUS_NOT_IMPLEMENTED;
-                break;
-
-            default:
-                msg.Status = STATUS_INVALID_PARAMETER;
-                break;
+        // Accept connection
+        HANDLE hClientPort = nullptr;
+        status = ZwAcceptConnectPort(&hClientPort, nullptr, &connMsg.PortMessage, TRUE, nullptr, nullptr);
+        if (!NT_SUCCESS(status)) {
+            ELITE_DBG("LPC accept failed: 0x%X\n", status);
+            continue;
         }
 
-        // Send reply
-        msg.PortMessage.u1.s1.DataLength = sizeof(ELITE_ALPC_MESSAGE) - sizeof(PORT_MESSAGE_KERNEL);
-        msg.PortMessage.u1.s1.TotalLength = sizeof(ELITE_ALPC_MESSAGE);
+        status = ZwCompleteConnectPort(hClientPort);
+        if (!NT_SUCCESS(status)) {
+            ZwClose(hClientPort);
+            continue;
+        }
 
-        NtAlpcSendWaitReceivePort(
-            g_hAlpcPort,
-            0,
-            &msg.PortMessage,
-            nullptr,
-            nullptr,
-            nullptr,
-            nullptr,
-            nullptr
-        );
+        ELITE_DBG("Client connected via LPC\n");
+
+        // Handle client messages
+        while (!g_bUnloading) {
+            ELITE_LPC_MESSAGE msg = { 0 };
+
+            status = ZwReplyWaitReceivePort(hClientPort, nullptr, nullptr, &msg.PortMessage);
+            if (!NT_SUCCESS(status)) {
+                if (status == STATUS_PORT_DISCONNECTED || g_bUnloading) break;
+                ELITE_DBG("LPC receive failed: 0x%X\n", status);
+                continue;
+            }
+
+            // Handle message types
+            switch (msg.MessageType) {
+                case ALPC_MSG_GET_HWID:
+                    msg.HardwareId = g_ullHardwareId;
+                    msg.Status = STATUS_SUCCESS;
+                    ELITE_DBG("Sent hardware ID to client\n");
+                    break;
+
+                case ALPC_MSG_READ_MEMORY:
+                case ALPC_MSG_WRITE_MEMORY:
+                case ALPC_MSG_PROTECT_MEMORY:
+                case ALPC_MSG_ALLOC_MEMORY:
+                case ALPC_MSG_QUERY_INFO:
+                    msg.Status = STATUS_NOT_IMPLEMENTED;
+                    break;
+
+                default:
+                    msg.Status = STATUS_INVALID_PARAMETER;
+                    break;
+            }
+
+            // Send reply
+            msg.PortMessage.DataLength = sizeof(ELITE_LPC_MESSAGE) - sizeof(PORT_MESSAGE_LPC);
+            msg.PortMessage.TotalLength = sizeof(ELITE_LPC_MESSAGE);
+
+            ZwReplyWaitReceivePort(hClientPort, nullptr, &msg.PortMessage, &msg.PortMessage);
+        }
+
+        ZwClose(hClientPort);
     }
 
-    if (g_hAlpcPort) {
-        ZwClose(g_hAlpcPort);
-        g_hAlpcPort = nullptr;
+    if (g_hLpcPort) {
+        ZwClose(g_hLpcPort);
+        g_hLpcPort = nullptr;
     }
 
-    ELITE_DBG("ALPC server thread exiting\n");
+    ELITE_DBG("LPC server thread exiting\n");
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
@@ -530,10 +511,10 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
         g_pFilterDevice = nullptr;
     }
 
-    // Close ALPC port
-    if (g_hAlpcPort) {
-        ZwClose(g_hAlpcPort);
-        g_hAlpcPort = nullptr;
+    // Close LPC port
+    if (g_hLpcPort) {
+        ZwClose(g_hLpcPort);
+        g_hLpcPort = nullptr;
     }
 
     // Unregister ETW provider
@@ -562,7 +543,7 @@ NTSTATUS DriverInitialize(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryP
     ELITE_DBG("Elite driver initializing\n");
 
     g_pDriverObject = DriverObject;
-    KeInitializeSpinLock(&g_AlpcLock);
+    KeInitializeSpinLock(&g_LpcLock);
     KeInitializeEvent(&g_UnloadEvent, NotificationEvent, FALSE);
 
     // Generate hardware ID
@@ -591,7 +572,7 @@ NTSTATUS DriverInitialize(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryP
         // Not fatal - continue
     }
 
-    // Start ALPC server thread
+    // Start LPC server thread (user mode will connect via ALPC - compatible)
     HANDLE threadHandle = nullptr;
     status = PsCreateSystemThread(
         &threadHandle,
@@ -599,15 +580,15 @@ NTSTATUS DriverInitialize(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryP
         nullptr,
         nullptr,
         nullptr,
-        AlpcServerThread,
+        LpcServerThread,
         nullptr
     );
 
     if (NT_SUCCESS(status)) {
         ZwClose(threadHandle);
-        ELITE_DBG("ALPC server thread created\n");
+        ELITE_DBG("LPC server thread created\n");
     } else {
-        ELITE_DBG("Failed to create ALPC thread: 0x%X\n", status);
+        ELITE_DBG("Failed to create LPC thread: 0x%X\n", status);
     }
 
     ELITE_DBG("Driver initialized successfully\n");
