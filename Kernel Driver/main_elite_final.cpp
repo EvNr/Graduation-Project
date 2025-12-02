@@ -136,24 +136,21 @@ typedef VOID (NTAPI *PETWENABLECALLBACK)(
     _In_opt_ PVOID CallbackContext
 );
 
-// ETW functions
-NTSTATUS EtwRegister(
+// ETW functions (declared in ntddk.h in newer WDK, keeping for compatibility)
+#ifndef EtwRegister
+NTSTATUS NTAPI EtwRegister(
     _In_ LPCGUID ProviderId,
     _In_opt_ PETWENABLECALLBACK EnableCallback,
     _In_opt_ PVOID CallbackContext,
     _Out_ PREGHANDLE RegHandle
 );
+#endif
 
-NTSTATUS EtwWrite(
-    _In_ REGHANDLE RegHandle,
-    _In_ PEVENT_TRACE_HEADER EventTrace,
-    _In_opt_ ULONG UserDataCount,
-    _In_opt_ PVOID UserData
-);
-
-NTSTATUS EtwUnregister(
+#ifndef EtwUnregister
+NTSTATUS NTAPI EtwUnregister(
     _In_ REGHANDLE RegHandle
 );
+#endif
 
 // Process/Thread APIs
 NTSTATUS NTAPI PsSuspendThread(PETHREAD Thread, PULONG PreviousSuspendCount);
@@ -320,7 +317,11 @@ NTSTATUS InitializeEtwProvider() {
     g_EtwProviderGuid.Data4[6] = 0x67;
     g_EtwProviderGuid.Data4[7] = 0x89;
 
-    NTSTATUS status = EtwRegister(
+    // Try to register ETW provider (may not be available in all WDK versions)
+    NTSTATUS status = STATUS_NOT_IMPLEMENTED;
+
+#ifdef EtwRegister
+    status = EtwRegister(
         &g_EtwProviderGuid,
         EtwEnableCallback,
         nullptr,
@@ -330,6 +331,9 @@ NTSTATUS InitializeEtwProvider() {
     if (NT_SUCCESS(status)) {
         ELITE_DBG("ETW provider registered successfully\n");
     }
+#else
+    ELITE_DBG("ETW functions not available in this WDK version\n");
+#endif
 
     return status;
 }
@@ -558,10 +562,12 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
     }
 
     // Unregister ETW provider
+#ifdef EtwUnregister
     if (g_hEtwProvider) {
         EtwUnregister(g_hEtwProvider);
         g_hEtwProvider = 0;
     }
+#endif
 
     ELITE_DBG("Driver unloaded\n");
 }
