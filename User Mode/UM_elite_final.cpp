@@ -430,52 +430,123 @@ private:
 
 public:
     bool Connect() {
-        // Read pointer from registry (kernel wrote it there)
-        HKEY hKey = nullptr;
-        LONG result = RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            L"SOFTWARE\\AudioKSE",
-            0,
-            KEY_READ,
-            &hKey
-        );
+        #ifdef _DEBUG
+        printf("[*] Attempting to connect to kernel driver...\n");
+        #endif
 
-        if (result != ERROR_SUCCESS) {
-            return false;
+        // Retry up to 10 times with delays (driver might still be mapping memory)
+        for (int retry = 0; retry < 10; retry++) {
+            if (retry > 0) {
+                #ifdef _DEBUG
+                printf("[*] Retry %d/10...\n", retry);
+                #endif
+                Sleep(500); // Wait 500ms between retries
+            }
+
+            // Read pointer from registry (kernel wrote it there)
+            HKEY hKey = nullptr;
+            LONG result = RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                L"SOFTWARE\\AudioKSE",
+                0,
+                KEY_READ,
+                &hKey
+            );
+
+            if (result != ERROR_SUCCESS) {
+                #ifdef _DEBUG
+                if (retry == 0) {
+                    printf("[-] Registry key not found (error: %d)\n", result);
+                    printf("[*] Driver may not be loaded or hasn't detected this process yet\n");
+                }
+                #endif
+                continue;
+            }
+
+            PVOID pointer = nullptr;
+            DWORD dataSize = sizeof(PVOID);
+            DWORD type = REG_BINARY;
+
+            result = RegQueryValueExW(
+                hKey,
+                L"DiagnosticBuffer",
+                nullptr,
+                &type,
+                (LPBYTE)&pointer,
+                &dataSize
+            );
+
+            RegCloseKey(hKey);
+
+            if (result != ERROR_SUCCESS) {
+                #ifdef _DEBUG
+                if (retry == 0) {
+                    printf("[-] Registry value not found (error: %d)\n", result);
+                }
+                #endif
+                continue;
+            }
+
+            if (!pointer) {
+                #ifdef _DEBUG
+                if (retry == 0) {
+                    printf("[-] Pointer is NULL\n");
+                }
+                #endif
+                continue;
+            }
+
+            #ifdef _DEBUG
+            printf("[+] Found kernel memory pointer: 0x%p\n", pointer);
+            #endif
+
+            // Cast to our structure - this is the kernel memory!
+            m_pShared = (PSHARED_MEMORY)pointer;
+
+            // Verify it's valid by reading hardware ID
+            __try {
+                m_hardwareId = m_pShared->HardwareId;
+                #ifdef _DEBUG
+                printf("[+] Hardware ID from kernel: 0x%llX\n", m_hardwareId);
+                #endif
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                #ifdef _DEBUG
+                printf("[-] Failed to read from mapped memory (access violation)\n");
+                #endif
+                m_pShared = nullptr;
+                continue;
+            }
+
+            // Test communication with ping
+            #ifdef _DEBUG
+            printf("[*] Testing communication with ping command...\n");
+            #endif
+
+            if (!SendCommand(CMD_PING)) {
+                #ifdef _DEBUG
+                printf("[-] Ping command failed\n");
+                #endif
+                m_pShared = nullptr;
+                continue;
+            }
+
+            #ifdef _DEBUG
+            printf("[+] Ping successful - connection established!\n");
+            #endif
+
+            return true;
         }
 
-        PVOID pointer = nullptr;
-        DWORD dataSize = sizeof(PVOID);
-        DWORD type = REG_BINARY;
+        #ifdef _DEBUG
+        printf("[-] Failed to connect after all retries\n");
+        printf("[!] Make sure:\n");
+        printf("    1. Driver is loaded (sc start AudioKSE or similar)\n");
+        printf("    2. This process was started AFTER driver loaded\n");
+        printf("    3. Process name is 'AudioDiagnostic.exe'\n");
+        #endif
 
-        result = RegQueryValueExW(
-            hKey,
-            L"DiagnosticBuffer",
-            nullptr,
-            &type,
-            (LPBYTE)&pointer,
-            &dataSize
-        );
-
-        RegCloseKey(hKey);
-
-        if (result != ERROR_SUCCESS || !pointer) {
-            return false;
-        }
-
-        // Cast to our structure - this is the kernel memory!
-        m_pShared = (PSHARED_MEMORY)pointer;
-
-        // Verify it's valid by checking hardware ID
-        m_hardwareId = m_pShared->HardwareId;
-
-        // Test communication with ping
-        if (!SendCommand(CMD_PING)) {
-            m_pShared = nullptr;
-            return false;
-        }
-
-        return true;
+        return false;
     }
 
     void Disconnect() {
@@ -486,18 +557,47 @@ public:
     bool SendCommand(LONG cmdId) {
         if (!m_pShared) return false;
 
+        #ifdef _DEBUG
+        printf("[*] Sending command %d to kernel...\n", cmdId);
+        #endif
+
         // Write command to shared memory - ZERO SYSCALLS!
-        m_pShared->CommandID = cmdId;
-        m_pShared->Status = STATUS_PENDING;
+        __try {
+            m_pShared->CommandID = cmdId;
+            m_pShared->Status = STATUS_PENDING;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            #ifdef _DEBUG
+            printf("[-] Access violation writing command\n");
+            #endif
+            return false;
+        }
 
         // Spin-wait for kernel to process (or you could sleep)
-        int timeout = 10000; // 10ms max
+        int timeout = 100000; // 100ms max
         while (m_pShared->CommandID != CMD_IDLE && timeout-- > 0) {
             _mm_pause(); // CPU hint for spin-wait
         }
 
+        if (timeout <= 0) {
+            #ifdef _DEBUG
+            printf("[-] Timeout waiting for kernel response\n");
+            #endif
+            return false;
+        }
+
         // Check if command completed
-        return m_pShared->Status == STATUS_SUCCESS;
+        bool success = (m_pShared->Status == STATUS_SUCCESS);
+
+        #ifdef _DEBUG
+        if (success) {
+            printf("[+] Command completed successfully (status: %d)\n", m_pShared->Status);
+        } else {
+            printf("[-] Command failed (status: %d)\n", m_pShared->Status);
+        }
+        #endif
+
+        return success;
     }
 
     ULONGLONG GetHardwareId() const { return m_hardwareId; }
