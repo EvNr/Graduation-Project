@@ -3,7 +3,7 @@
  * ==============================================
  *
  * Advanced anti-detection kernel driver for security research
- * Implements unconventional techniques for stealth operation
+ * Pure ALPC communication - NO IOCTL
  *
  * Target: <10% detection by commercial AC systems
  * Platform: Windows 10/11 x64
@@ -36,8 +36,6 @@
 // ============================================================================
 
 #define MASQ_DRIVER_NAME L"AudioKSE"
-#define MASQ_DEVICE_NAME L"\\Device\\AudioKse"
-#define MASQ_DOS_NAME L"\\DosDevices\\AudioKse"
 
 #pragma comment(linker, "/EXPORT:DriverEntry")
 #pragma comment(linker, "/VERSION:10.0")
@@ -54,18 +52,34 @@ const char g_CompanyName[] = "Microsoft Corporation";
 extern "C" {
 #endif
 
-// ALPC structures
-typedef struct _PORT_MESSAGE {
-    USHORT DataLength;
-    USHORT TotalLength;
-    ULONG MessageType;
-    ULONG DataInfoOffset;
-    CLIENT_ID ClientId;
+// ALPC structures - fully declared
+typedef struct _PORT_MESSAGE_KERNEL {
+    union {
+        struct {
+            USHORT DataLength;
+            USHORT TotalLength;
+        } s1;
+        ULONG Length;
+    } u1;
+    union {
+        struct {
+            USHORT Type;
+            USHORT DataInfoOffset;
+        } s2;
+        ULONG ZeroInit;
+    } u2;
+    union {
+        CLIENT_ID ClientId;
+        double DoNotUseThisField;
+    };
     ULONG MessageId;
-    ULONG CallbackId;
-} PORT_MESSAGE, *PPORT_MESSAGE;
+    union {
+        SIZE_T ClientViewSize;
+        ULONG CallbackId;
+    };
+} PORT_MESSAGE_KERNEL, *PPORT_MESSAGE_KERNEL;
 
-typedef struct _ALPC_PORT_ATTRIBUTES {
+typedef struct _ALPC_PORT_ATTRIBUTES_KERNEL {
     ULONG Flags;
     SECURITY_QUALITY_OF_SERVICE SecurityQos;
     SIZE_T MaxMessageLength;
@@ -75,28 +89,28 @@ typedef struct _ALPC_PORT_ATTRIBUTES {
     SIZE_T MaxViewSize;
     SIZE_T MaxTotalSectionSize;
     ULONG DupObjectTypes;
-} ALPC_PORT_ATTRIBUTES, *PALPC_PORT_ATTRIBUTES;
+} ALPC_PORT_ATTRIBUTES_KERNEL, *PALPC_PORT_ATTRIBUTES_KERNEL;
 
-typedef struct _ALPC_MESSAGE_ATTRIBUTES {
+typedef struct _ALPC_MESSAGE_ATTRIBUTES_KERNEL {
     ULONG AllocatedAttributes;
     ULONG ValidAttributes;
-} ALPC_MESSAGE_ATTRIBUTES, *PALPC_MESSAGE_ATTRIBUTES;
+} ALPC_MESSAGE_ATTRIBUTES_KERNEL, *PALPC_MESSAGE_ATTRIBUTES_KERNEL;
 
-// ALPC functions
+// ALPC Functions
 NTSYSAPI NTSTATUS NTAPI NtAlpcCreatePort(
     _Out_ PHANDLE PortHandle,
     _In_opt_ POBJECT_ATTRIBUTES ObjectAttributes,
-    _In_opt_ PALPC_PORT_ATTRIBUTES PortAttributes
+    _In_opt_ PALPC_PORT_ATTRIBUTES_KERNEL PortAttributes
 );
 
 NTSYSAPI NTSTATUS NTAPI NtAlpcSendWaitReceivePort(
     _In_ HANDLE PortHandle,
     _In_ ULONG Flags,
-    _In_opt_ PPORT_MESSAGE SendMessage,
-    _In_opt_ PALPC_MESSAGE_ATTRIBUTES SendMessageAttributes,
-    _Out_opt_ PPORT_MESSAGE ReceiveMessage,
+    _In_opt_ PPORT_MESSAGE_KERNEL SendMessage,
+    _In_opt_ PALPC_MESSAGE_ATTRIBUTES_KERNEL SendMessageAttributes,
+    _Out_opt_ PPORT_MESSAGE_KERNEL ReceiveMessage,
     _Inout_opt_ PSIZE_T BufferLength,
-    _Out_opt_ PALPC_MESSAGE_ATTRIBUTES ReceiveMessageAttributes,
+    _Out_opt_ PALPC_MESSAGE_ATTRIBUTES_KERNEL ReceiveMessageAttributes,
     _In_opt_ PLARGE_INTEGER Timeout
 );
 
@@ -105,28 +119,15 @@ NTSYSAPI NTSTATUS NTAPI NtAlpcAcceptConnectPort(
     _In_ HANDLE ConnectionPortHandle,
     _In_ ULONG Flags,
     _In_opt_ POBJECT_ATTRIBUTES ObjectAttributes,
-    _In_opt_ PALPC_PORT_ATTRIBUTES PortAttributes,
+    _In_opt_ PALPC_PORT_ATTRIBUTES_KERNEL PortAttributes,
     _In_opt_ PVOID PortContext,
-    _In_ PPORT_MESSAGE ConnectionRequest,
-    _Inout_opt_ PALPC_MESSAGE_ATTRIBUTES ConnectionMessageAttributes,
+    _In_ PPORT_MESSAGE_KERNEL ConnectionRequest,
+    _Inout_opt_ PALPC_MESSAGE_ATTRIBUTES_KERNEL ConnectionMessageAttributes,
     _In_ BOOLEAN AcceptConnection
 );
 
-// ETW structures
-typedef struct _EVENT_TRACE_HEADER {
-    USHORT Size;
-    USHORT FieldTypeFlags;
-    UCHAR Type;
-    UCHAR Level;
-    USHORT Version;
-    ULONG ThreadId;
-    ULONG ProcessId;
-    LARGE_INTEGER TimeStamp;
-    GUID Guid;
-    ULONG ProcessorTime;
-} EVENT_TRACE_HEADER, *PEVENT_TRACE_HEADER;
-
-typedef VOID (NTAPI *PETWENABLECALLBACK)(
+// ETW - use kernel mode callback signature
+typedef VOID (NTAPI *PETWENABLECALLBACK_KERNEL)(
     _In_ LPCGUID SourceId,
     _In_ ULONG IsEnabled,
     _In_ UCHAR Level,
@@ -136,32 +137,21 @@ typedef VOID (NTAPI *PETWENABLECALLBACK)(
     _In_opt_ PVOID CallbackContext
 );
 
-// ETW functions (declared in ntddk.h in newer WDK, keeping for compatibility)
-#ifndef EtwRegister
-NTSTATUS NTAPI EtwRegister(
+NTSYSAPI NTSTATUS NTAPI EtwRegister(
     _In_ LPCGUID ProviderId,
-    _In_opt_ PETWENABLECALLBACK EnableCallback,
+    _In_opt_ PETWENABLECALLBACK_KERNEL EnableCallback,
     _In_opt_ PVOID CallbackContext,
     _Out_ PREGHANDLE RegHandle
 );
-#endif
 
-#ifndef EtwUnregister
-NTSTATUS NTAPI EtwUnregister(
+NTSYSAPI NTSTATUS NTAPI EtwUnregister(
     _In_ REGHANDLE RegHandle
 );
-#endif
 
 // Process/Thread APIs
 NTSTATUS NTAPI PsSuspendThread(PETHREAD Thread, PULONG PreviousSuspendCount);
 NTKERNELAPI LONGLONG PsGetProcessCreateTimeQuadPart(PEPROCESS Process);
 NTSTATUS NTAPI PsResumeThread(PETHREAD Thread, PULONG PreviousSuspendCount);
-NTSTATUS NTAPI PsGetContextThread(PETHREAD Thread, PCONTEXT ThreadContext, KPROCESSOR_MODE Mode);
-NTSTATUS NTAPI PsSetContextThread(PETHREAD Thread, PCONTEXT ThreadContext, KPROCESSOR_MODE Mode);
-
-NTKERNELAPI PPEB NTAPI PsGetProcessPeb(_In_ PEPROCESS Process);
-NTKERNELAPI PVOID NTAPI PsGetProcessSectionBaseAddress(_In_ PEPROCESS Process);
-NTKERNELAPI PVOID PsGetProcessWow64Process(PEPROCESS Process);
 
 NTSYSAPI NTSTATUS NTAPI ZwQuerySystemInformation(
     _In_ ULONG SystemInformationClass,
@@ -198,9 +188,7 @@ PDEVICE_OBJECT g_pTargetDevice = nullptr;
 
 // ALPC communication
 HANDLE g_hAlpcPort = nullptr;
-HANDLE g_hAlpcClientPort = nullptr;
 KSPIN_LOCK g_AlpcLock;
-volatile BOOLEAN g_bAlpcConnected = FALSE;
 
 // ETW provider
 REGHANDLE g_hEtwProvider = 0;
@@ -222,15 +210,13 @@ ULONGLONG g_ullHardwareId = 0;
 #define ALPC_MSG_PROTECT_MEMORY 0x1003
 #define ALPC_MSG_ALLOC_MEMORY   0x1004
 #define ALPC_MSG_QUERY_INFO     0x1005
-#define ALPC_MSG_INJECT_CODE    0x1006
 #define ALPC_MSG_GET_HWID       0x1007
 
 typedef struct _ELITE_ALPC_MESSAGE {
-    PORT_MESSAGE PortMessage;
+    PORT_MESSAGE_KERNEL PortMessage;
     ULONG MessageType;
     HANDLE ProcessId;
     PVOID Address;
-    PVOID Buffer;
     SIZE_T Size;
     ULONG Protection;
     NTSTATUS Status;
@@ -283,7 +269,7 @@ ULONGLONG GenerateHardwareId() {
 // ETW PROVIDER
 // ============================================================================
 
-VOID EtwEnableCallback(
+VOID NTAPI EtwEnableCallback(
     _In_ LPCGUID SourceId,
     _In_ ULONG IsEnabled,
     _In_ UCHAR Level,
@@ -317,11 +303,7 @@ NTSTATUS InitializeEtwProvider() {
     g_EtwProviderGuid.Data4[6] = 0x67;
     g_EtwProviderGuid.Data4[7] = 0x89;
 
-    // Try to register ETW provider (may not be available in all WDK versions)
-    NTSTATUS status = STATUS_NOT_IMPLEMENTED;
-
-#ifdef EtwRegister
-    status = EtwRegister(
+    NTSTATUS status = EtwRegister(
         &g_EtwProviderGuid,
         EtwEnableCallback,
         nullptr,
@@ -330,10 +312,9 @@ NTSTATUS InitializeEtwProvider() {
 
     if (NT_SUCCESS(status)) {
         ELITE_DBG("ETW provider registered successfully\n");
+    } else {
+        ELITE_DBG("ETW provider registration failed: 0x%X (non-fatal)\n", status);
     }
-#else
-    ELITE_DBG("ETW functions not available in this WDK version\n");
-#endif
 
     return status;
 }
@@ -357,7 +338,7 @@ VOID AlpcServerThread(PVOID Context) {
     OBJECT_ATTRIBUTES objAttr;
     InitializeObjectAttributes(&objAttr, &portNameU, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, nullptr, nullptr);
 
-    ALPC_PORT_ATTRIBUTES portAttribs = { 0 };
+    ALPC_PORT_ATTRIBUTES_KERNEL portAttribs = { 0 };
     portAttribs.MaxMessageLength = sizeof(ELITE_ALPC_MESSAGE);
 
     NTSTATUS status = NtAlpcCreatePort(&g_hAlpcPort, &objAttr, &portAttribs);
@@ -382,7 +363,7 @@ VOID AlpcServerThread(PVOID Context) {
             0,
             nullptr,
             nullptr,
-            (PPORT_MESSAGE)&msg,
+            &msg.PortMessage,
             &msgLength,
             nullptr,
             &timeout
@@ -411,7 +392,6 @@ VOID AlpcServerThread(PVOID Context) {
             case ALPC_MSG_PROTECT_MEMORY:
             case ALPC_MSG_ALLOC_MEMORY:
             case ALPC_MSG_QUERY_INFO:
-            case ALPC_MSG_INJECT_CODE:
                 // TODO: Implement handlers
                 msg.Status = STATUS_NOT_IMPLEMENTED;
                 break;
@@ -420,6 +400,21 @@ VOID AlpcServerThread(PVOID Context) {
                 msg.Status = STATUS_INVALID_PARAMETER;
                 break;
         }
+
+        // Send reply
+        msg.PortMessage.u1.s1.DataLength = sizeof(ELITE_ALPC_MESSAGE) - sizeof(PORT_MESSAGE_KERNEL);
+        msg.PortMessage.u1.s1.TotalLength = sizeof(ELITE_ALPC_MESSAGE);
+
+        NtAlpcSendWaitReceivePort(
+            g_hAlpcPort,
+            0,
+            &msg.PortMessage,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr
+        );
     }
 
     if (g_hAlpcPort) {
@@ -444,27 +439,7 @@ NTSTATUS FilterDispatchPassThrough(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 NTSTATUS FilterDispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     UNREFERENCED_PARAMETER(DeviceObject);
 
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
-    ULONG ioctl = stack->Parameters.DeviceIoControl.IoControlCode;
-
-    // Check for our magic IOCTL
-    if (ioctl == CTL_CODE(FILE_DEVICE_BEEP, 0x999, METHOD_BUFFERED, FILE_ANY_ACCESS)) {
-        // Return hardware ID via legacy IOCTL (for compatibility)
-        if (stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(ULONGLONG)) {
-            ULONGLONG* pOutput = (ULONGLONG*)Irp->AssociatedIrp.SystemBuffer;
-            *pOutput = g_ullHardwareId;
-            Irp->IoStatus.Information = sizeof(ULONGLONG);
-            Irp->IoStatus.Status = STATUS_SUCCESS;
-        } else {
-            Irp->IoStatus.Status = STATUS_BUFFER_TOO_SMALL;
-            Irp->IoStatus.Information = 0;
-        }
-
-        IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return STATUS_SUCCESS;
-    }
-
-    // Pass through to real beep driver
+    // NO IOCTL handling - just pass through to real beep driver
     IoSkipCurrentIrpStackLocation(Irp);
     return IoCallDriver(g_pTargetDevice, Irp);
 }
@@ -562,12 +537,10 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
     }
 
     // Unregister ETW provider
-#ifdef EtwUnregister
     if (g_hEtwProvider) {
         EtwUnregister(g_hEtwProvider);
         g_hEtwProvider = 0;
     }
-#endif
 
     ELITE_DBG("Driver unloaded\n");
 }
