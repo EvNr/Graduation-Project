@@ -751,16 +751,23 @@ NTSTATUS EliteDriverInit(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPa
 }
 
 // ============================================================================
-// DRIVER ENTRY (TDL4 technique - no registry keys)
+// DRIVER ENTRY - Works with both KDMapper and sc start
 // ============================================================================
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
-    // Use TDL4 technique - load via IoCreateDriver to avoid service registry
-    UNREFERENCED_PARAMETER(DriverObject);
-    UNREFERENCED_PARAMETER(RegistryPath);
+    // CRITICAL: Print FIRST to verify DriverEntry is called
+    DbgPrint("=== DRIVER ENTRY CALLED ===\n");
+    DbgPrint("DriverObject: 0x%p\n", DriverObject);
 
+    // If we have a valid DriverObject (KDMapper, manual map), use it directly
+    if (DriverObject != nullptr) {
+        DbgPrint("=== Using provided DriverObject (KDMapper/Manual Map) ===\n");
+        return EliteDriverInit(DriverObject, RegistryPath);
+    }
+
+    // Otherwise, use TDL4 technique (sc start, normal loading)
+    DbgPrint("=== Using IoCreateDriver (Normal loading) ===\n");
     UNICODE_STRING driverName;
     RtlInitUnicodeString(&driverName, L"\\Driver\\AudioKSE");
-
     return IoCreateDriver(&driverName, &EliteDriverInit);
 }
