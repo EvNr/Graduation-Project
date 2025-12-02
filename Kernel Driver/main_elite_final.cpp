@@ -35,12 +35,9 @@
 
 #pragma comment(lib, "ntoskrnl.lib")
 
-// Debug output (only in debug builds)
-#ifdef _DEBUG
+// Debug output (ALWAYS enabled for troubleshooting)
+// Remove the #ifdef to see output in both Debug and Release
 #define ELITE_DBG(fmt, ...) DbgPrint("[AudioKSE] " fmt, ##__VA_ARGS__)
-#else
-#define ELITE_DBG(fmt, ...) ((void)0)
-#endif
 
 // ============================================================================
 // DRIVER MASQUERADING
@@ -614,6 +611,7 @@ NTSTATUS RegisterEtwProvider() {
 VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
     UNREFERENCED_PARAMETER(DriverObject);
 
+    DbgPrint("=== ELITE DRIVER UNLOADING ===\n");
     ELITE_DBG("Driver unloading\n");
 
     // Unregister process notify
@@ -692,6 +690,11 @@ VOID ScanForTargetProcess() {
 NTSTATUS EliteDriverInit(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
     UNREFERENCED_PARAMETER(RegistryPath);
 
+    DbgPrint("===============================================\n");
+    DbgPrint("=== ELITE KERNEL DRIVER LOADING ===\n");
+    DbgPrint("=== Target: AudioDiagnostic.exe ===\n");
+    DbgPrint("===============================================\n");
+
     ELITE_DBG("Elite driver initializing\n");
 
     g_pDriverObject = DriverObject;
@@ -736,11 +739,14 @@ NTSTATUS EliteDriverInit(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPa
     ScanForTargetProcess();
 
     if (g_UserMapping != nullptr) {
+        DbgPrint("=== INJECTION SUCCESS! Memory mapped at: 0x%p ===\n", g_UserMapping);
         ELITE_DBG("Driver initialized - target process found and injected\n");
     } else {
+        DbgPrint("=== Driver loaded. Waiting for AudioDiagnostic.exe to start ===\n");
         ELITE_DBG("Driver initialized - waiting for target process to start\n");
     }
 
+    DbgPrint("===============================================\n\n");
     return STATUS_SUCCESS;
 }
 
