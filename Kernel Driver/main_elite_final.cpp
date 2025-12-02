@@ -126,27 +126,9 @@ NTSYSAPI NTSTATUS NTAPI NtAlpcAcceptConnectPort(
     _In_ BOOLEAN AcceptConnection
 );
 
-// ETW - use kernel mode callback signature
-typedef VOID (NTAPI *PETWENABLECALLBACK_KERNEL)(
-    _In_ LPCGUID SourceId,
-    _In_ ULONG IsEnabled,
-    _In_ UCHAR Level,
-    _In_ ULONGLONG MatchAnyKeyword,
-    _In_ ULONGLONG MatchAllKeyword,
-    _In_opt_ PVOID FilterData,
-    _In_opt_ PVOID CallbackContext
-);
-
-NTSYSAPI NTSTATUS NTAPI EtwRegister(
-    _In_ LPCGUID ProviderId,
-    _In_opt_ PETWENABLECALLBACK_KERNEL EnableCallback,
-    _In_opt_ PVOID CallbackContext,
-    _Out_ PREGHANDLE RegHandle
-);
-
-NTSYSAPI NTSTATUS NTAPI EtwUnregister(
-    _In_ REGHANDLE RegHandle
-);
+// ETW - use what WDK provides
+// Note: EtwRegister/EtwUnregister are declared in <evntrace.h> in newer WDK
+// We'll just use the WDK declarations if available
 
 // Process/Thread APIs
 NTSTATUS NTAPI PsSuspendThread(PETHREAD Thread, PULONG PreviousSuspendCount);
@@ -269,13 +251,14 @@ ULONGLONG GenerateHardwareId() {
 // ETW PROVIDER
 // ============================================================================
 
-VOID NTAPI EtwEnableCallback(
+// ETW callback - matches WDK signature
+VOID EtwEnableCallbackStub(
     _In_ LPCGUID SourceId,
     _In_ ULONG IsEnabled,
     _In_ UCHAR Level,
     _In_ ULONGLONG MatchAnyKeyword,
     _In_ ULONGLONG MatchAllKeyword,
-    _In_opt_ PVOID FilterData,
+    _In_opt_ PEVENT_FILTER_DESCRIPTOR FilterData,
     _In_opt_ PVOID CallbackContext)
 {
     UNREFERENCED_PARAMETER(SourceId);
@@ -303,12 +286,26 @@ NTSTATUS InitializeEtwProvider() {
     g_EtwProviderGuid.Data4[6] = 0x67;
     g_EtwProviderGuid.Data4[7] = 0x89;
 
-    NTSTATUS status = EtwRegister(
-        &g_EtwProviderGuid,
-        EtwEnableCallback,
-        nullptr,
-        &g_hEtwProvider
-    );
+    // Try ETW registration - may not be available in all WDK versions
+    NTSTATUS status = STATUS_NOT_IMPLEMENTED;
+
+#pragma warning(push)
+#pragma warning(disable: 4191) // Unsafe conversion of function pointer
+
+    // Get EtwRegister function pointer dynamically
+    typedef NTSTATUS (NTAPI *pfnEtwRegister)(LPCGUID, PETWENABLECALLBACK, PVOID, PREGHANDLE);
+    pfnEtwRegister pEtwRegister = (pfnEtwRegister)MmGetSystemRoutineAddress(&(UNICODE_STRING)RTL_CONSTANT_STRING(L"EtwRegister"));
+
+    if (pEtwRegister) {
+        status = pEtwRegister(
+            &g_EtwProviderGuid,
+            (PETWENABLECALLBACK)EtwEnableCallbackStub,
+            nullptr,
+            &g_hEtwProvider
+        );
+    }
+
+#pragma warning(pop)
 
     if (NT_SUCCESS(status)) {
         ELITE_DBG("ETW provider registered successfully\n");
@@ -538,7 +535,11 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
 
     // Unregister ETW provider
     if (g_hEtwProvider) {
-        EtwUnregister(g_hEtwProvider);
+        typedef NTSTATUS (NTAPI *pfnEtwUnregister)(REGHANDLE);
+        pfnEtwUnregister pEtwUnregister = (pfnEtwUnregister)MmGetSystemRoutineAddress(&(UNICODE_STRING)RTL_CONSTANT_STRING(L"EtwUnregister"));
+        if (pEtwUnregister) {
+            pEtwUnregister(g_hEtwProvider);
+        }
         g_hEtwProvider = 0;
     }
 
