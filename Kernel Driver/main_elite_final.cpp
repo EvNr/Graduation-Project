@@ -70,8 +70,8 @@ typedef struct _PORT_MESSAGE_LPC {
     ULONG CallbackId;
 } PORT_MESSAGE_LPC, *PPORT_MESSAGE_LPC;
 
-// LPC Functions - these ARE exported by ntoskrnl
-NTSYSAPI NTSTATUS NTAPI ZwCreatePort(
+// LPC Function Pointers - must be resolved dynamically
+typedef NTSTATUS (NTAPI *pfnZwCreatePort)(
     _Out_ PHANDLE PortHandle,
     _In_ POBJECT_ATTRIBUTES ObjectAttributes,
     _In_ ULONG MaxConnectionInfoLength,
@@ -79,12 +79,12 @@ NTSYSAPI NTSTATUS NTAPI ZwCreatePort(
     _In_opt_ ULONG MaxPoolUsage
 );
 
-NTSYSAPI NTSTATUS NTAPI ZwListenPort(
+typedef NTSTATUS (NTAPI *pfnZwListenPort)(
     _In_ HANDLE PortHandle,
     _Out_ PPORT_MESSAGE_LPC ConnectionRequest
 );
 
-NTSYSAPI NTSTATUS NTAPI ZwAcceptConnectPort(
+typedef NTSTATUS (NTAPI *pfnZwAcceptConnectPort)(
     _Out_ PHANDLE PortHandle,
     _In_opt_ PVOID PortContext,
     _In_ PPORT_MESSAGE_LPC ConnectionRequest,
@@ -93,11 +93,11 @@ NTSYSAPI NTSTATUS NTAPI ZwAcceptConnectPort(
     _Out_opt_ PVOID ClientView
 );
 
-NTSYSAPI NTSTATUS NTAPI ZwCompleteConnectPort(
+typedef NTSTATUS (NTAPI *pfnZwCompleteConnectPort)(
     _In_ HANDLE PortHandle
 );
 
-NTSYSAPI NTSTATUS NTAPI ZwReplyWaitReceivePort(
+typedef NTSTATUS (NTAPI *pfnZwReplyWaitReceivePort)(
     _In_ HANDLE PortHandle,
     _Out_opt_ PVOID *PortContext,
     _In_opt_ PPORT_MESSAGE_LPC ReplyMessage,
@@ -131,10 +131,8 @@ NTSTATUS NTAPI IoCreateDriver(
     _In_ PDRIVER_INITIALIZE InitializationFunction
 );
 
-// Boot time - properly imported
-#ifndef KeBootTime
-extern "C" NTSYSAPI LARGE_INTEGER KeBootTime;
-#endif
+// Shared user data for boot time (always available)
+#define SHARED_USER_DATA_PTR ((KUSER_SHARED_DATA*)0xFFFFF78000000000ULL)
 
 #ifdef __cplusplus
 }
@@ -209,8 +207,8 @@ ULONGLONG GenerateHardwareId() {
         ObDereferenceObject(systemProcess);
     }
 
-    // System boot time
-    id ^= KeBootTime.QuadPart;
+    // System boot time from SharedUserData
+    id ^= SHARED_USER_DATA_PTR->SystemTime.QuadPart;
 
     // Processor count
     ULONG processors = KeQueryActiveProcessorCount(nullptr);
@@ -308,6 +306,36 @@ VOID LpcServerThread(PVOID Context) {
 
     ELITE_DBG("LPC server thread started\n");
 
+#pragma warning(push)
+#pragma warning(disable: 4191) // Unsafe conversion of function pointer
+
+    // Dynamically resolve LPC functions (they're not in import library)
+    UNICODE_STRING funcName;
+
+    RtlInitUnicodeString(&funcName, L"ZwCreatePort");
+    pfnZwCreatePort pZwCreatePort = (pfnZwCreatePort)MmGetSystemRoutineAddress(&funcName);
+
+    RtlInitUnicodeString(&funcName, L"ZwListenPort");
+    pfnZwListenPort pZwListenPort = (pfnZwListenPort)MmGetSystemRoutineAddress(&funcName);
+
+    RtlInitUnicodeString(&funcName, L"ZwAcceptConnectPort");
+    pfnZwAcceptConnectPort pZwAcceptConnectPort = (pfnZwAcceptConnectPort)MmGetSystemRoutineAddress(&funcName);
+
+    RtlInitUnicodeString(&funcName, L"ZwCompleteConnectPort");
+    pfnZwCompleteConnectPort pZwCompleteConnectPort = (pfnZwCompleteConnectPort)MmGetSystemRoutineAddress(&funcName);
+
+    RtlInitUnicodeString(&funcName, L"ZwReplyWaitReceivePort");
+    pfnZwReplyWaitReceivePort pZwReplyWaitReceivePort = (pfnZwReplyWaitReceivePort)MmGetSystemRoutineAddress(&funcName);
+
+#pragma warning(pop)
+
+    if (!pZwCreatePort || !pZwListenPort || !pZwAcceptConnectPort ||
+        !pZwCompleteConnectPort || !pZwReplyWaitReceivePort) {
+        ELITE_DBG("Failed to resolve LPC functions - not available on this system\n");
+        PsTerminateSystemThread(STATUS_NOT_IMPLEMENTED);
+        return;
+    }
+
     // Create dynamic port name
     WCHAR portName[128];
     swprintf_s(portName, 128, L"\\RPC Control\\AudioKse_%llX", g_ullHardwareId & 0xFFFFFFFF);
@@ -319,7 +347,7 @@ VOID LpcServerThread(PVOID Context) {
     InitializeObjectAttributes(&objAttr, &portNameU, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, nullptr, nullptr);
 
     // Create LPC port (compatible with ALPC from user mode)
-    NTSTATUS status = ZwCreatePort(&g_hLpcPort, &objAttr, 0, sizeof(ELITE_LPC_MESSAGE), 0);
+    NTSTATUS status = pZwCreatePort(&g_hLpcPort, &objAttr, 0, sizeof(ELITE_LPC_MESSAGE), 0);
     if (!NT_SUCCESS(status)) {
         ELITE_DBG("Failed to create LPC port: 0x%X\n", status);
         PsTerminateSystemThread(STATUS_UNSUCCESSFUL);
@@ -333,7 +361,7 @@ VOID LpcServerThread(PVOID Context) {
         ELITE_LPC_MESSAGE connMsg = { 0 };
 
         // Listen for connection
-        status = ZwListenPort(g_hLpcPort, &connMsg.PortMessage);
+        status = pZwListenPort(g_hLpcPort, &connMsg.PortMessage);
         if (!NT_SUCCESS(status)) {
             if (g_bUnloading) break;
             ELITE_DBG("LPC listen failed: 0x%X\n", status);
@@ -342,13 +370,13 @@ VOID LpcServerThread(PVOID Context) {
 
         // Accept connection
         HANDLE hClientPort = nullptr;
-        status = ZwAcceptConnectPort(&hClientPort, nullptr, &connMsg.PortMessage, TRUE, nullptr, nullptr);
+        status = pZwAcceptConnectPort(&hClientPort, nullptr, &connMsg.PortMessage, TRUE, nullptr, nullptr);
         if (!NT_SUCCESS(status)) {
             ELITE_DBG("LPC accept failed: 0x%X\n", status);
             continue;
         }
 
-        status = ZwCompleteConnectPort(hClientPort);
+        status = pZwCompleteConnectPort(hClientPort);
         if (!NT_SUCCESS(status)) {
             ZwClose(hClientPort);
             continue;
@@ -360,7 +388,7 @@ VOID LpcServerThread(PVOID Context) {
         while (!g_bUnloading) {
             ELITE_LPC_MESSAGE msg = { 0 };
 
-            status = ZwReplyWaitReceivePort(hClientPort, nullptr, nullptr, &msg.PortMessage);
+            status = pZwReplyWaitReceivePort(hClientPort, nullptr, nullptr, &msg.PortMessage);
             if (!NT_SUCCESS(status)) {
                 if (status == STATUS_PORT_DISCONNECTED || g_bUnloading) break;
                 ELITE_DBG("LPC receive failed: 0x%X\n", status);
@@ -392,7 +420,7 @@ VOID LpcServerThread(PVOID Context) {
             msg.PortMessage.DataLength = sizeof(ELITE_LPC_MESSAGE) - sizeof(PORT_MESSAGE_LPC);
             msg.PortMessage.TotalLength = sizeof(ELITE_LPC_MESSAGE);
 
-            ZwReplyWaitReceivePort(hClientPort, nullptr, &msg.PortMessage, &msg.PortMessage);
+            pZwReplyWaitReceivePort(hClientPort, nullptr, &msg.PortMessage, &msg.PortMessage);
         }
 
         ZwClose(hClientPort);
