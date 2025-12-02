@@ -652,6 +652,40 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
 }
 
 // ============================================================================
+// SCAN FOR ALREADY RUNNING TARGET PROCESS
+// ============================================================================
+// Process notify only fires for NEW processes
+// If user runs exe BEFORE loading driver, we need to scan for it
+
+VOID ScanForTargetProcess() {
+    ELITE_DBG("Scanning for already-running target process...\n");
+
+    // Enumerate all processes
+    PEPROCESS process = PsGetCurrentProcess();
+
+    for (int i = 0; i < 65536 && !g_bUnloading && g_UserMapping == nullptr; i += 4) {
+        PEPROCESS proc = nullptr;
+        if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)i, &proc))) {
+            PCHAR processName = (PCHAR)PsGetProcessImageFileName(proc);
+
+            if (_stricmp(processName, TARGET_PROCESS_NAME) == 0) {
+                ELITE_DBG("Found already-running target process! PID: %d, Name: %s\n", i, processName);
+
+                // Manually call the injection logic
+                ProcessNotifyCallback(nullptr, (HANDLE)(ULONG_PTR)i, TRUE);
+
+                ObDereferenceObject(proc);
+                return; // Found it, stop scanning
+            }
+
+            ObDereferenceObject(proc);
+        }
+    }
+
+    ELITE_DBG("No already-running target process found\n");
+}
+
+// ============================================================================
 // DRIVER INITIALIZATION
 // ============================================================================
 
@@ -690,15 +724,23 @@ NTSTATUS EliteDriverInit(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPa
         // Not fatal - continue
     }
 
-    // Register process notify callback - THIS IS WHERE THE MAGIC HAPPENS
+    // Register process notify callback for FUTURE process starts
     status = PsSetCreateProcessNotifyRoutine(ProcessNotifyCallback, FALSE);
     if (!NT_SUCCESS(status)) {
         ELITE_DBG("Failed to register process notify: 0x%X\n", status);
         return status;
     }
 
-    ELITE_DBG("Process notify registered - waiting for target process\n");
-    ELITE_DBG("Driver initialized successfully\n");
+    // CRITICAL: Also scan for ALREADY RUNNING target process
+    // (Process notify won't fire if process started before driver loaded)
+    ScanForTargetProcess();
+
+    if (g_UserMapping != nullptr) {
+        ELITE_DBG("Driver initialized - target process found and injected\n");
+    } else {
+        ELITE_DBG("Driver initialized - waiting for target process to start\n");
+    }
+
     return STATUS_SUCCESS;
 }
 
