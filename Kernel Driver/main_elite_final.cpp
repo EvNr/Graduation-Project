@@ -759,15 +759,58 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     DbgPrint("=== DRIVER ENTRY CALLED ===\n");
     DbgPrint("DriverObject: 0x%p\n", DriverObject);
 
-    // If we have a valid DriverObject (KDMapper, manual map), use it directly
+    NTSTATUS status;
+
+    // If we have a valid DriverObject (some manual mappers provide it), use it directly
     if (DriverObject != nullptr) {
-        DbgPrint("=== Using provided DriverObject (KDMapper/Manual Map) ===\n");
-        return EliteDriverInit(DriverObject, RegistryPath);
+        DbgPrint("=== Using provided DriverObject (Manual Map with valid object) ===\n");
+        status = EliteDriverInit(DriverObject, RegistryPath);
+        DbgPrint("=== EliteDriverInit returned: 0x%X ===\n", status);
+        return status;
     }
 
-    // Otherwise, use TDL4 technique (sc start, normal loading)
-    DbgPrint("=== Using IoCreateDriver (Normal loading) ===\n");
+    // KDMapper and most manual mappers pass NULL - try IoCreateDriver
+    DbgPrint("=== DriverObject is NULL - trying IoCreateDriver ===\n");
     UNICODE_STRING driverName;
     RtlInitUnicodeString(&driverName, L"\\Driver\\AudioKSE");
-    return IoCreateDriver(&driverName, &EliteDriverInit);
+
+    status = IoCreateDriver(&driverName, &EliteDriverInit);
+    DbgPrint("=== IoCreateDriver returned: 0x%X ===\n", status);
+
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("=== IoCreateDriver FAILED (0x%X)! Using KDMapper-compatible mode ===\n", status);
+        DbgPrint("=== Skipping device creation, running core functionality only ===\n");
+
+        // KDMapper mode: Skip DriverObject-dependent features
+        // Just do the core injection without filter device
+
+        g_pDriverObject = nullptr;  // Mark as manual map mode
+        KeInitializeEvent(&g_UnloadEvent, NotificationEvent, FALSE);
+
+        // Generate hardware ID
+        g_ullHardwareId = GenerateHardwareId();
+        DbgPrint("[AudioKSE] Hardware ID: 0x%llX\n", g_ullHardwareId);
+
+        // Register process notify callback (doesn't need DriverObject)
+        status = PsSetCreateProcessNotifyRoutine(ProcessNotifyCallback, FALSE);
+        if (!NT_SUCCESS(status)) {
+            DbgPrint("=== CRITICAL: Process notify registration failed: 0x%X ===\n", status);
+            return status;
+        }
+
+        // Scan for already running target
+        ScanForTargetProcess();
+
+        if (g_UserMapping != nullptr) {
+            DbgPrint("=== INJECTION SUCCESS (KDMapper mode)! Pointer: 0x%p ===\n", g_UserMapping);
+        } else {
+            DbgPrint("=== Driver loaded (KDMapper mode). Waiting for target process ===\n");
+        }
+
+        DbgPrint("===============================================\n\n");
+        return STATUS_SUCCESS;
+    }
+
+    DbgPrint("=== IoCreateDriver succeeded ===\n");
+    return status;
 }
