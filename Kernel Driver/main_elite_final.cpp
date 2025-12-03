@@ -395,112 +395,120 @@ VOID ProcessNotifyCallback(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create) {
         return;
     }
 
-    // Get process name
+    // Get process name for logging
     PCHAR processName = (PCHAR)PsGetProcessImageFileName(process);
+    ELITE_DBG("Injecting into process! PID: %llu, Name: %s\n", (ULONGLONG)ProcessId, processName);
 
-    // Check if this is our target process
-    if (_stricmp(processName, TARGET_PROCESS_NAME) == 0) {
-        ELITE_DBG("Target process detected! PID: %llu, Name: %s\n", (ULONGLONG)ProcessId, processName);
+    // 1. Allocate kernel memory (NonPagedPool - always in RAM)
+    g_KernelBuffer = ExAllocatePoolWithTag(NonPagedPool, SHARED_MEM_SIZE, 'TILE');
+    if (!g_KernelBuffer) {
+        ELITE_DBG("Failed to allocate kernel buffer\n");
+        ObDereferenceObject(process);
+        return;
+    }
 
-        // 1. Allocate kernel memory (NonPagedPool - always in RAM)
-        g_KernelBuffer = ExAllocatePoolWithTag(NonPagedPool, SHARED_MEM_SIZE, 'TILE');
-        if (!g_KernelBuffer) {
-            ELITE_DBG("Failed to allocate kernel buffer\n");
-            ObDereferenceObject(process);
-            return;
-        }
+    RtlZeroMemory(g_KernelBuffer, SHARED_MEM_SIZE);
 
-        RtlZeroMemory(g_KernelBuffer, SHARED_MEM_SIZE);
+    // Initialize shared memory header
+    PSHARED_MEMORY shared = (PSHARED_MEMORY)g_KernelBuffer;
+    shared->CommandID = CMD_IDLE;
+    shared->Status = STATUS_PENDING;
+    shared->HardwareId = g_ullHardwareId;
 
-        // Initialize shared memory header
-        PSHARED_MEMORY shared = (PSHARED_MEMORY)g_KernelBuffer;
-        shared->CommandID = CMD_IDLE;
-        shared->Status = STATUS_PENDING;
-        shared->HardwareId = g_ullHardwareId;
+    // 2. Create MDL (Memory Descriptor List)
+    g_Mdl = IoAllocateMdl(g_KernelBuffer, SHARED_MEM_SIZE, FALSE, FALSE, nullptr);
+    if (!g_Mdl) {
+        ELITE_DBG("Failed to allocate MDL\n");
+        ExFreePoolWithTag(g_KernelBuffer, 'TILE');
+        g_KernelBuffer = nullptr;
+        ObDereferenceObject(process);
+        return;
+    }
 
-        // 2. Create MDL (Memory Descriptor List)
-        g_Mdl = IoAllocateMdl(g_KernelBuffer, SHARED_MEM_SIZE, FALSE, FALSE, nullptr);
-        if (!g_Mdl) {
-            ELITE_DBG("Failed to allocate MDL\n");
-            ExFreePoolWithTag(g_KernelBuffer, 'TILE');
-            g_KernelBuffer = nullptr;
-            ObDereferenceObject(process);
-            return;
-        }
+    // Lock pages in memory
+    __try {
+        MmProbeAndLockPages(g_Mdl, KernelMode, IoModifyAccess);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        ELITE_DBG("Failed to lock pages\n");
+        IoFreeMdl(g_Mdl);
+        g_Mdl = nullptr;
+        ExFreePoolWithTag(g_KernelBuffer, 'TILE');
+        g_KernelBuffer = nullptr;
+        ObDereferenceObject(process);
+        return;
+    }
 
-        // Lock pages in memory
-        __try {
-            MmProbeAndLockPages(g_Mdl, KernelMode, IoModifyAccess);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            ELITE_DBG("Failed to lock pages\n");
-            IoFreeMdl(g_Mdl);
-            g_Mdl = nullptr;
-            ExFreePoolWithTag(g_KernelBuffer, 'TILE');
-            g_KernelBuffer = nullptr;
-            ObDereferenceObject(process);
-            return;
-        }
+    // 3. Attach to user process and map memory
+    KAPC_STATE apc;
+    KeStackAttachProcess(process, &apc);
 
-        // 3. Attach to user process and map memory
-        KAPC_STATE apc;
-        KeStackAttachProcess(process, &apc);
-
-        // Map locked pages into user mode address space
-        __try {
-            g_UserMapping = MmMapLockedPagesSpecifyCache(
-                g_Mdl,
-                UserMode,
-                MmCached,
-                nullptr,
-                FALSE,
-                NormalPagePriority
-            );
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            g_UserMapping = nullptr;
-        }
-
-        if (!g_UserMapping) {
-            ELITE_DBG("Failed to map into user mode\n");
-            KeUnstackDetachProcess(&apc);
-            MmUnlockPages(g_Mdl);
-            IoFreeMdl(g_Mdl);
-            g_Mdl = nullptr;
-            ExFreePoolWithTag(g_KernelBuffer, 'TILE');
-            g_KernelBuffer = nullptr;
-            ObDereferenceObject(process);
-            return;
-        }
-
-        ELITE_DBG("MEMORY INJECTED! User mode pointer: 0x%p\n", g_UserMapping);
-
-        // 4. Write pointer to registry for user mode to find
-        WritePointerToRegistry(g_UserMapping);
-
-        KeUnstackDetachProcess(&apc);
-
-        // Keep process reference
-        g_UserProcess = process;
-        ObReferenceObject(process);
-
-        // 5. Start worker thread to monitor commands
-        NTSTATUS status = PsCreateSystemThread(
-            &g_WorkerThreadHandle,
-            THREAD_ALL_ACCESS,
+    // Map locked pages into user mode address space
+    __try {
+        g_UserMapping = MmMapLockedPagesSpecifyCache(
+            g_Mdl,
+            UserMode,
+            MmCached,
             nullptr,
-            nullptr,
-            nullptr,
-            SharedMemoryWorker,
-            nullptr
+            FALSE,
+            NormalPagePriority
         );
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_UserMapping = nullptr;
+    }
 
-        if (!NT_SUCCESS(status)) {
-            ELITE_DBG("Failed to create worker thread: 0x%X\n", status);
-            CleanupSharedMemory();
-        } else {
-            ELITE_DBG("Worker thread started successfully\n");
+    if (!g_UserMapping) {
+        ELITE_DBG("Failed to map into user mode\n");
+        KeUnstackDetachProcess(&apc);
+        MmUnlockPages(g_Mdl);
+        IoFreeMdl(g_Mdl);
+        g_Mdl = nullptr;
+        ExFreePoolWithTag(g_KernelBuffer, 'TILE');
+        g_KernelBuffer = nullptr;
+        ObDereferenceObject(process);
+        return;
+    }
+
+    ELITE_DBG("MEMORY INJECTED! User mode pointer: 0x%p\n", g_UserMapping);
+
+    // 4. Write pointer to PEB for user mode to find (STEALTH - no registry!)
+    // PEB offset 0x320 is in reserved space, safe to use
+    __try {
+        PPEB peb = PsGetProcessPeb(process);
+        if (peb) {
+            PVOID* pebSlot = (PVOID*)((ULONG_PTR)peb + 0x320);
+            *pebSlot = g_UserMapping;
+            ELITE_DBG("Wrote pointer to PEB+0x320: 0x%p\n", g_UserMapping);
         }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        ELITE_DBG("Failed to write to PEB, falling back to registry\n");
+        WritePointerToRegistry(g_UserMapping);
+    }
+
+    KeUnstackDetachProcess(&apc);
+
+    // Keep process reference
+    g_UserProcess = process;
+    ObReferenceObject(process);
+
+    // 5. Start worker thread to monitor commands
+    NTSTATUS status = PsCreateSystemThread(
+        &g_WorkerThreadHandle,
+        THREAD_ALL_ACCESS,
+        nullptr,
+        nullptr,
+        nullptr,
+        SharedMemoryWorker,
+        nullptr
+    );
+
+    if (!NT_SUCCESS(status)) {
+        ELITE_DBG("Failed to create worker thread: 0x%X\n", status);
+        CleanupSharedMemory();
+    } else {
+        ELITE_DBG("Worker thread started successfully\n");
     }
 
     ObDereferenceObject(process);

