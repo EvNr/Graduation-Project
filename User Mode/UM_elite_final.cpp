@@ -595,13 +595,16 @@ public:
             return false;
         }
 
-        // Spin-wait for kernel to process (or you could sleep)
-        int timeout = 100000; // 100ms max
-        while (m_pShared->CommandID != CMD_IDLE && timeout-- > 0) {
-            _mm_pause(); // CPU hint for spin-wait
+        // Wait for kernel to process command
+        // Kernel worker sleeps 10us between checks, so give it time
+        for (int i = 0; i < 100; i++) { // 100ms total (1ms * 100)
+            if (m_pShared->CommandID == CMD_IDLE) {
+                break;
+            }
+            Sleep(1); // 1ms sleep
         }
 
-        if (timeout <= 0) {
+        if (m_pShared->CommandID != CMD_IDLE) {
             #ifdef _DEBUG
             printf("[-] Timeout waiting for kernel response\n");
             #endif
