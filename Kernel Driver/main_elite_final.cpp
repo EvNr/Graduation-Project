@@ -791,24 +791,32 @@ NTSTATUS EliteDriverInit(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPa
         // Not fatal - continue
     }
 
-    // Register process notify callback for FUTURE process starts
+    // Register process notify callback (used by injection logic)
     status = PsSetCreateProcessNotifyRoutine(ProcessNotifyCallback, FALSE);
     if (!NT_SUCCESS(status)) {
         ELITE_DBG("Failed to register process notify: 0x%X\n", status);
         return status;
     }
 
-    // CRITICAL: Also scan for ALREADY RUNNING target process
-    // (Process notify won't fire if process started before driver loaded)
-    ScanForTargetProcess();
+    // Start mailbox polling thread
+    HANDLE hThread = nullptr;
+    status = PsCreateSystemThread(
+        &hThread,
+        THREAD_ALL_ACCESS,
+        nullptr,
+        nullptr,
+        nullptr,
+        MailboxPollingThread,
+        nullptr
+    );
 
-    if (g_UserMapping != nullptr) {
-        DbgPrint("=== INJECTION SUCCESS! Memory mapped at: 0x%p ===\n", g_UserMapping);
-        ELITE_DBG("Driver initialized - target process found and injected\n");
-    } else {
-        DbgPrint("=== Driver loaded. Waiting for AudioDiagnostic.exe to start ===\n");
-        ELITE_DBG("Driver initialized - waiting for target process to start\n");
+    if (!NT_SUCCESS(status)) {
+        ELITE_DBG("Failed to create mailbox thread: 0x%X\n", status);
+        return status;
     }
+
+    ZwClose(hThread);
+    ELITE_DBG("Mailbox polling thread started - waiting for user mode connection\n");
 
     DbgPrint("===============================================\n\n");
     return STATUS_SUCCESS;
