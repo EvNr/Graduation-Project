@@ -475,7 +475,8 @@ VOID ProcessNotifyCallback(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create) {
     // 4. Write pointer to PEB for user mode to find (STEALTH - no registry!)
     // PEB offset 0x320 is in reserved space, safe to use
     __try {
-        PPEB peb = PsGetProcessPeb(process);
+        // Get PEB address - it's at offset 0x550 in EPROCESS on x64
+        PPEB peb = *(PPEB*)((ULONG_PTR)process + 0x550);
         if (peb) {
             PVOID* pebSlot = (PVOID*)((ULONG_PTR)peb + 0x320);
             *pebSlot = g_UserMapping;
