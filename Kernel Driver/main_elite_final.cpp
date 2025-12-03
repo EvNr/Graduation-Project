@@ -60,10 +60,26 @@ const char g_CompanyName[] = "Microsoft Corporation";
 #define TARGET_PROCESS_NAME "AudioDiagnostic.exe"  // User mode executable name
 
 // ============================================================================
-// SHARED MEMORY STRUCTURE - The "Whiteboard"
+// COMMUNICATION MAILBOX - For KDMapper compatibility
 // ============================================================================
-// This structure lives in kernel memory but is directly accessible from user mode
-// Zero syscalls needed - just memory reads/writes
+// User mode finds this in kernel memory and writes to it
+// No process callbacks needed - completely manual
+
+#pragma section(".shared", read, write)
+__declspec(allocate(".shared"))
+volatile struct {
+    ULONG Magic;              // 0x4B444D50 ('KDMP')
+    ULONG Command;            // 0=None, 1=InjectMe, 2=Disconnect
+    ULONG ProcessId;          // Process requesting injection
+    PVOID UserModePointer;    // Result: pointer to injected memory
+    NTSTATUS Status;          // Result status
+    ULONGLONG HardwareId;     // Hardware ID
+} g_Mailbox = { 0x4B444D50, 0, 0, nullptr, 0, 0 };
+
+// Commands
+#define MAILBOX_CMD_NONE        0
+#define MAILBOX_CMD_INJECT      1
+#define MAILBOX_CMD_DISCONNECT  2
 
 typedef struct _SHARED_MEMORY {
     volatile LONG CommandID;    // 0 = Idle, 1 = Ping, 2 = GetHWID, etc.
@@ -650,37 +666,85 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
 }
 
 // ============================================================================
-// SCAN FOR ALREADY RUNNING TARGET PROCESS
+// MAILBOX POLLING THREAD - KDMapper Compatible
 // ============================================================================
-// Process notify only fires for NEW processes
-// If user runs exe BEFORE loading driver, we need to scan for it
+// Polls g_Mailbox for commands from user mode
+// User mode writes to kernel memory directly - no callbacks needed
 
-VOID ScanForTargetProcess() {
-    ELITE_DBG("Scanning for already-running target process...\n");
+VOID MailboxPollingThread(PVOID Context) {
+    UNREFERENCED_PARAMETER(Context);
 
-    // Enumerate all processes
-    PEPROCESS process = PsGetCurrentProcess();
+    DbgPrint("[AudioKSE] Mailbox polling thread started\n");
+    DbgPrint("[AudioKSE] Polling for user mode connection requests...\n");
 
-    for (int i = 0; i < 65536 && !g_bUnloading && g_UserMapping == nullptr; i += 4) {
-        PEPROCESS proc = nullptr;
-        if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)i, &proc))) {
-            PCHAR processName = (PCHAR)PsGetProcessImageFileName(proc);
+    g_Mailbox.HardwareId = g_ullHardwareId;
 
-            if (_stricmp(processName, TARGET_PROCESS_NAME) == 0) {
-                ELITE_DBG("Found already-running target process! PID: %d, Name: %s\n", i, processName);
+    while (!g_bUnloading && g_UserMapping == nullptr) {
+        // Check registry for connection request from user mode
+        UNICODE_STRING keyPath, valueName;
+        RtlInitUnicodeString(&keyPath, L"\\Registry\\Machine\\SOFTWARE\\AudioKSE");
+        RtlInitUnicodeString(&valueName, L"RequestPID");
 
-                // Manually call the injection logic
-                ProcessNotifyCallback(nullptr, (HANDLE)(ULONG_PTR)i, TRUE);
+        OBJECT_ATTRIBUTES objAttr;
+        InitializeObjectAttributes(&objAttr, &keyPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
 
-                ObDereferenceObject(proc);
-                return; // Found it, stop scanning
+        HANDLE hKey = nullptr;
+        NTSTATUS status = ZwOpenKey(&hKey, KEY_READ, &objAttr);
+
+        if (NT_SUCCESS(status)) {
+            UCHAR buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+            PKEY_VALUE_PARTIAL_INFORMATION pValueInfo = (PKEY_VALUE_PARTIAL_INFORMATION)buffer;
+            ULONG resultLength = 0;
+
+            status = ZwQueryValueKey(hKey, &valueName, KeyValuePartialInformation, pValueInfo, sizeof(buffer), &resultLength);
+
+            if (NT_SUCCESS(status) && pValueInfo->Type == REG_DWORD && pValueInfo->DataLength == sizeof(ULONG)) {
+                ULONG pid = *(PULONG)pValueInfo->Data;
+
+                if (pid != 0) {
+                    DbgPrint("[AudioKSE] Connection request from PID: %d\n", pid);
+
+                    // Look up the process
+                    PEPROCESS process = nullptr;
+                    status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+
+                    if (NT_SUCCESS(status)) {
+                        // Call the injection logic
+                        ProcessNotifyCallback(nullptr, (HANDLE)(ULONG_PTR)pid, TRUE);
+
+                        if (g_UserMapping != nullptr) {
+                            DbgPrint("[AudioKSE] Injection SUCCESS! Pointer: 0x%p\n", g_UserMapping);
+
+                            // Write pointer to registry for user mode
+                            WritePointerToRegistry(g_UserMapping);
+
+                            // Clear the request
+                            ULONG zero = 0;
+                            UNICODE_STRING clearName;
+                            RtlInitUnicodeString(&clearName, L"RequestPID");
+                            ZwSetValueKey(hKey, &clearName, 0, REG_DWORD, &zero, sizeof(ULONG));
+                        } else {
+                            DbgPrint("[AudioKSE] Injection FAILED\n");
+                        }
+
+                        ObDereferenceObject(process);
+                    } else {
+                        DbgPrint("[AudioKSE] Process lookup failed: 0x%X\n", status);
+                    }
+                }
             }
 
-            ObDereferenceObject(proc);
+            ZwClose(hKey);
         }
+
+        // Sleep briefly
+        LARGE_INTEGER interval;
+        interval.QuadPart = -5000000LL; // 500ms
+        KeDelayExecutionThread(KernelMode, FALSE, &interval);
     }
 
-    ELITE_DBG("No already-running target process found\n");
+    DbgPrint("[AudioKSE] Mailbox polling thread exiting\n");
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 // ============================================================================
@@ -791,21 +855,28 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
         g_ullHardwareId = GenerateHardwareId();
         DbgPrint("[AudioKSE] Hardware ID: 0x%llX\n", g_ullHardwareId);
 
-        // Register process notify callback (doesn't need DriverObject)
-        status = PsSetCreateProcessNotifyRoutine(ProcessNotifyCallback, FALSE);
+        // Start mailbox polling thread (no callbacks needed!)
+        DbgPrint("[AudioKSE] Starting mailbox polling thread (KDMapper compatible)\n");
+
+        HANDLE hThread = nullptr;
+        status = PsCreateSystemThread(
+            &hThread,
+            THREAD_ALL_ACCESS,
+            nullptr,
+            nullptr,
+            nullptr,
+            MailboxPollingThread,
+            nullptr
+        );
+
         if (!NT_SUCCESS(status)) {
-            DbgPrint("=== CRITICAL: Process notify registration failed: 0x%X ===\n", status);
+            DbgPrint("=== CRITICAL: Failed to create mailbox thread: 0x%X ===\n", status);
             return status;
         }
 
-        // Scan for already running target
-        ScanForTargetProcess();
-
-        if (g_UserMapping != nullptr) {
-            DbgPrint("=== INJECTION SUCCESS (KDMapper mode)! Pointer: 0x%p ===\n", g_UserMapping);
-        } else {
-            DbgPrint("=== Driver loaded (KDMapper mode). Waiting for target process ===\n");
-        }
+        ZwClose(hThread);
+        DbgPrint("=== Mailbox thread started successfully ===\n");
+        DbgPrint("=== User mode: Find g_Mailbox, write PID, set Command=1 ===\n");
 
         DbgPrint("===============================================\n\n");
         return STATUS_SUCCESS;

@@ -432,20 +432,62 @@ public:
     bool Connect() {
         #ifdef _DEBUG
         printf("[*] Attempting to connect to kernel driver...\n");
+        printf("[*] Current PID: %d\n", GetCurrentProcessId());
         #endif
 
-        // Retry up to 10 times with delays (driver might still be mapping memory)
-        for (int retry = 0; retry < 10; retry++) {
+        // Step 1: Signal kernel by writing our PID to registry
+        HKEY hKey = nullptr;
+        LONG result = RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\AudioKSE",
+            0,
+            nullptr,
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE | KEY_READ,
+            nullptr,
+            &hKey,
+            nullptr
+        );
+
+        if (result != ERROR_SUCCESS) {
+            #ifdef _DEBUG
+            printf("[-] Failed to create/open registry key (error: %d)\n", result);
+            printf("[!] Try running as Administrator\n");
+            #endif
+            return false;
+        }
+
+        DWORD pid = GetCurrentProcessId();
+        result = RegSetValueExW(
+            hKey,
+            L"RequestPID",
+            0,
+            REG_DWORD,
+            (BYTE*)&pid,
+            sizeof(DWORD)
+        );
+
+        RegCloseKey(hKey);
+
+        if (result != ERROR_SUCCESS) {
+            #ifdef _DEBUG
+            printf("[-] Failed to write PID to registry (error: %d)\n", result);
+            #endif
+            return false;
+        }
+
+        #ifdef _DEBUG
+        printf("[+] Wrote connection request to registry\n");
+        printf("[*] Waiting for kernel to inject memory...\n");
+        #endif
+
+        // Step 2: Wait for kernel to inject memory and write pointer
+        for (int retry = 0; retry < 20; retry++) {
             if (retry > 0) {
-                #ifdef _DEBUG
-                printf("[*] Retry %d/10...\n", retry);
-                #endif
                 Sleep(500); // Wait 500ms between retries
             }
 
-            // Read pointer from registry (kernel wrote it there)
-            HKEY hKey = nullptr;
-            LONG result = RegOpenKeyExW(
+            result = RegOpenKeyExW(
                 HKEY_LOCAL_MACHINE,
                 L"SOFTWARE\\AudioKSE",
                 0,
@@ -454,12 +496,6 @@ public:
             );
 
             if (result != ERROR_SUCCESS) {
-                #ifdef _DEBUG
-                if (retry == 0) {
-                    printf("[-] Registry key not found (error: %d)\n", result);
-                    printf("[*] Driver may not be loaded or hasn't detected this process yet\n");
-                }
-                #endif
                 continue;
             }
 
@@ -478,21 +514,7 @@ public:
 
             RegCloseKey(hKey);
 
-            if (result != ERROR_SUCCESS) {
-                #ifdef _DEBUG
-                if (retry == 0) {
-                    printf("[-] Registry value not found (error: %d)\n", result);
-                }
-                #endif
-                continue;
-            }
-
-            if (!pointer) {
-                #ifdef _DEBUG
-                if (retry == 0) {
-                    printf("[-] Pointer is NULL\n");
-                }
-                #endif
+            if (result != ERROR_SUCCESS || !pointer) {
                 continue;
             }
 
@@ -539,11 +561,11 @@ public:
         }
 
         #ifdef _DEBUG
-        printf("[-] Failed to connect after all retries\n");
+        printf("[-] Failed to connect after 20 retries (10 seconds)\n");
         printf("[!] Make sure:\n");
-        printf("    1. Driver is loaded (sc start AudioKSE or similar)\n");
-        printf("    2. This process was started AFTER driver loaded\n");
-        printf("    3. Process name is 'AudioDiagnostic.exe'\n");
+        printf("    1. Driver is loaded (via KDMapper or sc start)\n");
+        printf("    2. Running as Administrator\n");
+        printf("    3. Check DbgView for kernel debug output\n");
         #endif
 
         return false;
