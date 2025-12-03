@@ -472,21 +472,8 @@ VOID ProcessNotifyCallback(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create) {
 
     ELITE_DBG("MEMORY INJECTED! User mode pointer: 0x%p\n", g_UserMapping);
 
-    // 4. Write pointer to PEB for user mode to find (STEALTH - no registry!)
-    // PEB offset 0x320 is in reserved space, safe to use
-    __try {
-        // Get PEB address - it's at offset 0x550 in EPROCESS on x64
-        PPEB peb = *(PPEB*)((ULONG_PTR)process + 0x550);
-        if (peb) {
-            PVOID* pebSlot = (PVOID*)((ULONG_PTR)peb + 0x320);
-            *pebSlot = g_UserMapping;
-            ELITE_DBG("Wrote pointer to PEB+0x320: 0x%p\n", g_UserMapping);
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        ELITE_DBG("Failed to write to PEB, falling back to registry\n");
-        WritePointerToRegistry(g_UserMapping);
-    }
+    // 4. Write pointer to registry for user mode to find
+    WritePointerToRegistry(g_UserMapping);
 
     KeUnstackDetachProcess(&apc);
 

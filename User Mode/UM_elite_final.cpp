@@ -435,51 +435,7 @@ public:
         printf("[*] Current PID: %d\n", GetCurrentProcessId());
         #endif
 
-        // Step 1: Try reading from PEB first (STEALTH - no registry access!)
-        #ifdef _DEBUG
-        printf("[*] Checking PEB for kernel pointer...\n");
-        #endif
-
-        PPEB peb = (PPEB)__readgsqword(0x60); // Read PEB from TEB
-        if (peb) {
-            PVOID* pebSlot = (PVOID*)((ULONG_PTR)peb + 0x320);
-            PVOID pointer = *pebSlot;
-
-            if (pointer) {
-                #ifdef _DEBUG
-                printf("[+] Found pointer in PEB+0x320: 0x%p\n", pointer);
-                #endif
-
-                m_pShared = (PSHARED_MEMORY)pointer;
-
-                // Verify it's valid
-                __try {
-                    m_hardwareId = m_pShared->HardwareId;
-                    #ifdef _DEBUG
-                    printf("[+] Hardware ID from kernel: 0x%llX\n", m_hardwareId);
-                    printf("[*] Testing communication with ping command...\n");
-                    #endif
-
-                    if (SendCommand(CMD_PING)) {
-                        #ifdef _DEBUG
-                        printf("[+] Ping successful - PEB connection established!\n");
-                        #endif
-                        return true;
-                    }
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER) {
-                    #ifdef _DEBUG
-                    printf("[-] PEB pointer invalid, falling back to registry method\n");
-                    #endif
-                }
-            }
-        }
-
-        // Step 2: Fallback to registry method if PEB didn't work
-        #ifdef _DEBUG
-        printf("[*] Using registry handoff method...\n");
-        #endif
-
+        // Signal kernel by writing our PID to registry
         HKEY hKey = nullptr;
         LONG result = RegCreateKeyExW(
             HKEY_LOCAL_MACHINE,
