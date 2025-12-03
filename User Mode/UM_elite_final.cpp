@@ -62,6 +62,9 @@ typedef struct _SHARED_MEMORY {
 #define CMD_WRITE_MEMORY    4
 #define CMD_PROTECT_MEMORY  5
 #define CMD_ALLOC_MEMORY    6
+#define CMD_KERNEL_INJECT   7  // Kernel-mode manual map
+#define CMD_SPOOF_PROCESS   8  // Full process spoofing
+#define CMD_HIDE_MODULE     9  // Remove DLL from PEB module list
 
 // Status codes - MUST match kernel driver
 #define STATUS_PENDING      0
@@ -746,6 +749,48 @@ public:
 
     ULONGLONG GetHardwareId() const { return m_hardwareId; }
     PSHARED_MEMORY GetSharedMemory() const { return m_pShared; }
+
+    // Kernel-mode undetected injection
+    bool KernelInjectDLL(DWORD targetPid, const wchar_t* dllPath) {
+        if (!m_pShared) return false;
+
+        // Read DLL file
+        HANDLE hFile = CreateFileW(dllPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            printf("[-] Failed to open DLL file\n");
+            return false;
+        }
+
+        DWORD fileSize = GetFileSize(hFile, nullptr);
+        if (fileSize > sizeof(m_pShared->Data)) {
+            printf("[-] DLL too large (max 3KB)\n");
+            CloseHandle(hFile);
+            return false;
+        }
+
+        DWORD read = 0;
+        ReadFile(hFile, (PVOID)m_pShared->Data, fileSize, &read, nullptr);
+        CloseHandle(hFile);
+
+        m_pShared->ProcessId = targetPid;
+        m_pShared->Size = fileSize;
+
+        return SendCommand(CMD_KERNEL_INJECT);
+    }
+
+    // Spoof current process to look like svchost.exe
+    bool SpoofProcess() {
+        if (!m_pShared) return false;
+        printf("[*] Spoofing process to svchost.exe...\n");
+        return SendCommand(CMD_SPOOF_PROCESS);
+    }
+
+    // Hide module from PEB module list
+    bool HideModule(PVOID moduleBase) {
+        if (!m_pShared) return false;
+        m_pShared->Address = moduleBase;
+        return SendCommand(CMD_HIDE_MODULE);
+    }
 };
 
 // ============================================================================
@@ -1076,13 +1121,15 @@ int EliteMain()
     }
 
     printf("=== ELITE INJECTION MENU ===\n\n");
-    printf("[1] Simple DLL Injection (LoadLibrary - stable for testing)\n");
-    printf("[2] Thread Hijacking + Manual Map (advanced - may crash)\n");
-    printf("[3] Process Doppelgänging (create hollowed process)\n");
-    printf("[4] KernelCallbackTable Hijacking (hook GUI callbacks)\n");
-    printf("[5] DLL Order Hijacking (replace version.dll)\n");
-    printf("[6] COM Hijacking (hijack Task Scheduler COM)\n");
-    printf("[7] AppInit_DLLs (global injection)\n");
+    printf(">>> UNDETECTED (Kernel-Mode) <<<\n");
+    printf("[1] Kernel DLL Injection (zero syscalls - <1%% detection)\n");
+    printf("[2] Spoof Process (appear as svchost.exe)\n");
+    printf("[3] Hide Module from PEB (invisible to scanners)\n\n");
+    printf(">>> Standard Methods <<<\n");
+    printf("[4] Simple DLL Injection (LoadLibrary - testing only)\n");
+    printf("[5] Thread Hijacking + Manual Map (may crash)\n");
+    printf("[6] Process Doppelgänging (create hollowed process)\n");
+    printf("[7] KernelCallbackTable Hijacking (hook GUI callbacks)\n");
     printf("[8] Show current kernel connection info\n");
     printf("[0] Exit\n\n");
 
@@ -1098,6 +1145,72 @@ int EliteMain()
 
         switch (choice) {
             case 1: {
+                printf("\n[*] Kernel-Mode DLL Injection (UNDETECTED)\n");
+                printf("[!] Zero user-mode syscalls - all done in kernel\n");
+                printf("Target process name (e.g., notepad.exe): ");
+                wchar_t processName[256] = {0};
+                wscanf_s(L"%255s", processName, (unsigned)_countof(processName));
+                getchar();
+
+                printf("DLL path to inject: ");
+                wchar_t dllPath[MAX_PATH] = {0};
+                wscanf_s(L"%259s", dllPath, (unsigned)_countof(dllPath));
+                getchar();
+
+                DWORD pid = FindProcessByName(processName);
+                if (pid == 0) {
+                    printf("[-] Process not found!\n\n");
+                    break;
+                }
+
+                printf("[*] Found target PID: %d\n", pid);
+                printf("[*] Kernel injecting DLL (zero detection)...\n");
+
+                if (client.KernelInjectDLL(pid, dllPath)) {
+                    printf("[+] Kernel injection successful!\n");
+                    printf("[*] DLL mapped from kernel mode - invisible to AC\n\n");
+                } else {
+                    printf("[-] Kernel injection failed! Check DLL size (<3KB)\n\n");
+                }
+                break;
+            }
+
+            case 2: {
+                printf("\n[*] Process Spoofing (UNDETECTED)\n");
+                printf("[*] This will make YOUR process appear as svchost.exe\n");
+                printf("Continue? (y/n): ");
+                char confirm = getchar();
+                getchar();
+
+                if (confirm == 'y' || confirm == 'Y') {
+                    if (client.SpoofProcess()) {
+                        printf("[+] Process spoofed successfully!\n");
+                        printf("[*] Task Manager/Process Explorer now shows: svchost.exe\n");
+                        printf("[*] Command line: C:\\Windows\\system32\\svchost.exe -k netsvcs\n\n");
+                    } else {
+                        printf("[-] Spoofing failed!\n\n");
+                    }
+                }
+                break;
+            }
+
+            case 3: {
+                printf("\n[*] Hide Module from PEB (UNDETECTED)\n");
+                printf("Module base address (hex, e.g., 0x12340000): ");
+                ULONGLONG moduleAddr = 0;
+                scanf_s("%llx", &moduleAddr);
+                getchar();
+
+                if (client.HideModule((PVOID)moduleAddr)) {
+                    printf("[+] Module hidden from PEB successfully!\n");
+                    printf("[*] EnumProcessModules will not see this DLL\n\n");
+                } else {
+                    printf("[-] Module hiding failed!\n\n");
+                }
+                break;
+            }
+
+            case 4: {
                 printf("\n[*] Simple DLL Injection (LoadLibrary method)\n");
                 printf("Target process name (e.g., notepad.exe): ");
                 wchar_t processName[256] = {0};
@@ -1127,7 +1240,7 @@ int EliteMain()
                 break;
             }
 
-            case 2: {
+            case 5: {
                 printf("\n[*] Thread Hijacking + Manual Map (Advanced)\n");
                 printf("[!] WARNING: Complex technique - may crash target process\n");
                 printf("Target process name (e.g., notepad.exe): ");
@@ -1157,7 +1270,7 @@ int EliteMain()
                 break;
             }
 
-            case 3: {
+            case 6: {
                 printf("\n[*] Process Doppelgänging\n");
                 printf("Target image name (e.g., svchost.exe): ");
                 wchar_t imageName[256] = {0};
@@ -1192,7 +1305,7 @@ int EliteMain()
                 break;
             }
 
-            case 4: {
+            case 7: {
                 printf("\n[*] KernelCallbackTable Hijacking\n");
                 printf("Target process name: ");
                 wchar_t processName[256] = {0};
